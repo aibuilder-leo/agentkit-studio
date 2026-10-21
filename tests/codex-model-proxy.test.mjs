@@ -111,6 +111,43 @@ test('EOF without a completion marker is an error, not a successful Responses re
   } finally { await proxy.close(); }
 });
 
+// Like a real fetch body, the paced upstream errors as soon as its request signal aborts.
+const pacedStream = (frames, gapMs, signal) => new ReadableStream({ async start(controller) {
+  const encoder = new TextEncoder();
+  for (const frame of frames) {
+    await new Promise(resolve => setTimeout(resolve, gapMs));
+    if (signal.aborted) { controller.error(signal.reason); return; }
+    controller.enqueue(encoder.encode(frame));
+  }
+  controller.close();
+} });
+
+test('a model still streaming past the idle budget is not cut off', async () => {
+  const frames = [...Array.from({ length: 6 }, (_, i) => `data: {"choices":[{"delta":{"content":"p${i}"}}]}\n\n`),
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n', 'data: [DONE]\n\n'];
+  const proxy = await createCodexModelProxy({ profile, idleTimeoutMs: 150, fetchImpl: async (_url, { signal }) => {
+    assert.equal(signal.aborted, false);
+    return new Response(pacedStream(frames, 50, signal), { headers: { 'Content-Type': 'text/event-stream' } });
+  } });
+  try {
+    const response = await fetch(`${proxy.baseUrl}/responses`, { method: 'POST', headers: { Authorization: `Bearer ${proxy.apiKey}` }, body: JSON.stringify({ input: 'hi', stream: true }) });
+    const wire = await response.text();
+    assert.match(wire, /response.completed/); assert.doesNotMatch(wire, /"type":"error"/);
+  } finally { await proxy.close(); }
+});
+
+test('upstream silence beyond the idle budget fails the stream', async () => {
+  const proxy = await createCodexModelProxy({ profile, idleTimeoutMs: 50, fetchImpl: async (_url, { signal }) => new Response(new ReadableStream({ start(controller) {
+    controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+    signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+  } }), { headers: { 'Content-Type': 'text/event-stream' } }) });
+  try {
+    const response = await fetch(`${proxy.baseUrl}/responses`, { method: 'POST', headers: { Authorization: `Bearer ${proxy.apiKey}` }, body: JSON.stringify({ input: 'hi', stream: true }) });
+    const wire = await response.text();
+    assert.match(wire, /event: error/); assert.doesNotMatch(wire, /response.completed/);
+  } finally { await proxy.close(); }
+});
+
 test('disconnect cancels an in-flight upstream request', async () => {
   let cancelled, started;
   const cancelledPromise = new Promise(resolve => { cancelled = resolve; });

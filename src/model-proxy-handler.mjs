@@ -5,8 +5,9 @@ import { randomUUID } from 'node:crypto';
 import { responsesToChat, chatToResponses, createResponsesStreamTransformer } from './model-proxy.mjs';
 import { readSse } from './sse.mjs';
 import { prepareCodexProxyRequest } from './codex-proxy-tools.mjs';
+import { createModelIdleDeadline } from '../packages/agentkit-harness/src/model-idle-deadline.mjs';
 
-export function createModelProxyHandler({ models, admit, fetchImpl = hostFetch, codexTools = false, onRequestMetrics }) {
+export function createModelProxyHandler({ models, admit, fetchImpl = hostFetch, codexTools = false, onRequestMetrics, idleTimeoutMs = 120000 }) {
   return async (request, response) => {
     const admission = admit(request);
     if ('rejection' in admission) { response.writeHead(admission.rejection); response.end(); return; }
@@ -15,7 +16,9 @@ export function createModelProxyHandler({ models, admit, fetchImpl = hostFetch, 
     const controller = new AbortController();
     const disconnect = () => { if (!response.writableEnded) controller.abort(); };
     response.on('close', disconnect);
-    const timer = setTimeout(() => controller.abort(), 120000);
+    // Bound upstream silence, not total duration: a long streaming answer
+    // keeps the request alive while data is still arriving.
+    const deadline = createModelIdleDeadline({ signal: controller.signal, timeoutMs: idleTimeoutMs });
     try {
       const chunks = []; let size = 0;
       for await (const chunk of request) {
@@ -45,7 +48,7 @@ export function createModelProxyHandler({ models, admit, fetchImpl = hostFetch, 
       }
       const upstream = await fetchImpl(`${profile.baseUrl}/chat/completions`, {
         method: 'POST', headers: { Authorization: `Bearer ${profile.apiKey}`, 'Content-Type': 'application/json' },
-        body: serialized, signal: controller.signal, redirect: 'error',
+        body: serialized, signal: deadline.signal, redirect: 'error',
       });
       if (!upstream.ok) {
         await upstream.body?.cancel();
@@ -58,12 +61,12 @@ export function createModelProxyHandler({ models, admit, fetchImpl = hostFetch, 
         return;
       }
       response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
-      const write = async data => { if (data && !response.write(data)) await once(response, 'drain', { signal: controller.signal }); };
-      if (!convert) { for await (const bytes of upstream.body) await write(bytes); }
+      const write = async data => { if (data && !response.write(data)) await once(response, 'drain', { signal: deadline.signal }); };
+      if (!convert) { for await (const bytes of upstream.body) { if (bytes.length) deadline.touch(); await write(bytes); } }
       else {
         const transformer = createResponsesStreamTransformer({ model: profile.modelName, toolContext });
         let done = false;
-        for await (const chunk of readSse(upstream.body, { onDone: () => { done = true; } })) await write(transformer.handle(chunk));
+        for await (const chunk of readSse(upstream.body, { onDone: () => { done = true; }, onChunk: deadline.touch })) await write(transformer.handle(chunk));
         // Some compatible gateways omit `choices[*].finish_reason` on the
         // final usage-only chunk and signal completion with [DONE]. The SSE
         // parser already consumed that sentinel, so the transformer closes
@@ -82,6 +85,6 @@ export function createModelProxyHandler({ models, admit, fetchImpl = hostFetch, 
         response.writeHead(error.status || (code === 'INVALID_JSON' || code === 'UNSUPPORTED_TOOL_TYPE' ? 400 : 502), { 'Content-Type': 'application/json' });
         response.end(JSON.stringify(value));
       } else response.end(`event: error\ndata: ${JSON.stringify({ type: 'error', ...value.error })}\n\n`);
-    } finally { clearTimeout(timer); response.off('close', disconnect); }
+    } finally { deadline.dispose(); response.off('close', disconnect); }
   };
 }
