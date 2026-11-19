@@ -24,7 +24,7 @@ test('overview start cards and workspace use only existing actions and totals', 
   const stats = all.find(node => node.props.className === 'studio-stats studio-panel');
   assert.deepEqual(stats.children.map(cell => cell.children.map(text)), [['3', 'Agent'], ['2', '运行时'], ['—', '资源'], ['—', '交付']]);
   for (const label of ['对话创建', '手动配置', '从模板开始', '去配置']) all.find(node => node.type === 'button' && (text(node) === label || node.children.some(child => child.type === 'strong' && text(child) === label))).props.onClick();
-  assert.deepEqual(events, ['agentkit-studio:open-authoring', 'agentkit-studio:open-settings']);
+  assert.deepEqual(events, ['agentkit-studio:open-authoring', 'agentkit-studio:create-manual-agent', 'agentkit-studio:open-settings']);
   assert.deepEqual(routes, ['agents', 'experts']);
   assert.equal(all.some(node => node.props.onClick && text(node).startsWith('运行时')), false);
 });
@@ -43,20 +43,28 @@ test('overview empty/loading and error states keep recovery and credential warni
 });
 
 test('runtime catalog renders disabled Star Harness and existing Codex availability as rows', () => {
-  const Page = createRuntimeCatalogPage({ ui: ui(['ready', [{ runtimeType: 'harness' }, { runtimeType: 'codex' }, { runtimeType: 'dsh-native' }], false, '']), hostRemote: {}, window: {} });
+  const Page = createRuntimeCatalogPage({ ui: ui(['ready', [{ runtimeType: 'harness' }, { runtimeType: 'codex' }, { runtimeType: 'dsh-native' }], false, false, '']), hostRemote: {}, window: {} });
   const rows = nodes(Page({})).filter(node => node.props.className === 'studio-row studio-runtime-row');
   assert.equal(rows.length, 3);
   assert.equal(rows[0].props['aria-disabled'], true);
-  assert.equal(rows[0].props.title, '该能力暂未开放');
-  assert.match(text(rows[0]), /未开放/);
+  assert.equal(rows[0].props.title, '在插件页安装并启用 Star Harness');
+  assert.match(text(rows[0]), /未安装/);
   assert.doesNotMatch(text(rows[0]), /可选/);
   assert.match(text(rows[1]), /Provider 未注册/);
-  assert.equal(nodes(rows[0]).some(node => node.type === 'button'), false);
+  assert.ok(nodes(rows[0]).some(node => node.type === 'button' && text(node) === '打开插件中心'));
+});
+
+test('runtime catalog makes an installed and enabled Star Harness available', () => {
+  const Page = createRuntimeCatalogPage({ ui: ui(['ready', [{ runtimeType: 'harness' }], true, true, '']), hostRemote: {}, window: {} });
+  const row = nodes(Page({})).find(node => node.props.className === 'studio-row studio-runtime-row');
+  assert.equal(row.props['aria-disabled'], undefined);
+  assert.match(text(row), /可选/);
+  assert.doesNotMatch(text(row), /未安装/);
 });
 
 test('runtime catalog empty and failed reads keep existing recovery', () => {
   for (const [status, title] of [['ready', '没有可用运行目标'], ['error', '运行目标不可用']]) {
-    const Page = createRuntimeCatalogPage({ ui: ui([status, [], false, 'Catalog offline']), hostRemote: {}, window: {} });
+    const Page = createRuntimeCatalogPage({ ui: ui([status, [], false, false, 'Catalog offline']), hostRemote: {}, window: {} });
     const empty = nodes(Page({})).find(node => node.type === 'EmptyState');
     assert.equal(empty.props.title, title);
     if (status === 'error') assert.equal(empty.props.detail, 'Catalog offline');
@@ -106,4 +114,20 @@ test('operational headings group multiple actions at the right without losing em
   assert.equal(group.children[0], actions);
   assert.ok(nodes(heading).some(node => node.props.title === '连接错误'));
   assert.equal(OperationalPageHeading({ title: '观测' }).children.length, 1);
+});
+
+test('manual Agent create intent survives the panel switch and is consumed once', async () => {
+  const { MANUAL_AGENT_CREATE_EVENT, consumeManualAgentCreate, requestManualAgentCreate } = await import('../src/client/state/agent-create-intent.mjs');
+  const events = [];
+  const window = { dispatchEvent: event => events.push(event.type) };
+  requestManualAgentCreate(window);
+  assert.deepEqual(events, [MANUAL_AGENT_CREATE_EVENT]);
+  // A workspace that mounts after the click consumes the pending intent once.
+  assert.equal(consumeManualAgentCreate(), true);
+  assert.equal(consumeManualAgentCreate(), false);
+  // A workspace that is already mounted takes the announced event instead.
+  requestManualAgentCreate(window);
+  assert.deepEqual(events, [MANUAL_AGENT_CREATE_EVENT, MANUAL_AGENT_CREATE_EVENT]);
+  assert.equal(consumeManualAgentCreate(), true);
+  assert.equal(consumeManualAgentCreate(), false);
 });

@@ -5,6 +5,10 @@ import { managedRuntimePrincipal } from './managed-runtime-identity.mjs';
 import { readManagedSessionMessages, readManagedSessionEvents } from './managed-session-history.mjs';
 import { runtimeError } from './runtime-responses-contract.mjs';
 import { managedRuntimeBootstrap } from './managed-runtime-capabilities.mjs';
+import { businessInvocationId, normalizeBusinessInvocation } from './providers/business-invocation-context.mjs';
+
+const BUSINESS_USER_INPUT = '__agentkit_business_user_id';
+const BUSINESS_SESSION_INPUT = '__agentkit_business_session_id';
 
 /** Accept the Responses compatibility input for one approval decision. */
 function approvalResponseItem(value) {
@@ -18,11 +22,16 @@ function approvalResponseItem(value) {
   return { requestId: item.approval_request_id, approve: item.approve };
 }
 
-export async function createManagedRuntimeActions({ ctx, runtime, admit, model, models, directory, approval, executionPolicy, allowedPermissionModes }) {
+export async function createManagedRuntimeActions({ ctx, runtime, admit, model, models, directory, approval, executionPolicy, allowedPermissionModes, env = process.env }) {
   const registry = await createManagedSessionRegistry(directory);
   const controller = ctx.get('sessionController'), sessions = ctx.get('sessions'), persistence = ctx.get('sessionPersistence');
   if (!controller || !sessions || !persistence) throw runtimeError('RUNTIME_SESSION_PERSISTENCE_REQUIRED', 503);
   const retiring = new Set();
+  const declaredMcp = runtime.declaration?.resources?.mcp_servers;
+  // A deployment can require business user attribution for its MCP bindings.
+  // BusinessSessionId is optional and never participates in session routing.
+  const requiresBusinessIdentity = Array.isArray(declaredMcp) && declaredMcp.length > 0
+    && /^(?:1|true|yes|on|require|required)$/i.test(String(env?.AGENTKIT_MCP_BUSINESS_IDENTITY ?? '').trim());
   let cancelSession = () => {}, cancelRun = () => false;
   function principal(headers, input = {}) {
     if ((input.AgentId && input.AgentId !== runtime.identity.agentId) || (headers['x-auth-agent-id'] && headers['x-auth-agent-id'] !== runtime.identity.agentId)) throw runtimeError('RUNTIME_AGENT_NOT_FOUND', 404);
@@ -53,12 +62,25 @@ export async function createManagedRuntimeActions({ ctx, runtime, admit, model, 
     }
     await flush(nativeId);
   }
-  async function ensure(id, nativeId, owner, signal) {
+  async function ensure(id, nativeId, owner, signal, { businessUserId, businessSessionId, requireBusinessUser = false } = {}) {
     return registry.serial(id, async () => {
       let record = await registry.read(id);
+      if (record && (record.owner !== owner.digest || record.nativeSessionId !== nativeId)) throw runtimeError('RUNTIME_SESSION_NOT_FOUND', 404);
+      if (requireBusinessUser && !businessUserId && !record?.businessUserId) throw runtimeError('RUNTIME_BUSINESS_ID_REQUIRED');
       if (record) {
-        if (record.owner !== owner.digest || record.nativeSessionId !== nativeId) throw runtimeError('RUNTIME_SESSION_NOT_FOUND', 404);
+        if ((businessUserId && record.businessUserId && record.businessUserId !== businessUserId)
+          || (businessSessionId && record.explicitBusinessSessionId && record.explicitBusinessSessionId !== businessSessionId)) {
+          throw runtimeError('RUNTIME_BUSINESS_SESSION_CONFLICT', 409);
+        }
         if (record.phase === 'deleted' || record.phase === 'deleting' || retiring.has(nativeId)) throw runtimeError('RUNTIME_SESSION_UNAVAILABLE', 409);
+        // The legacy businessSessionId on disk was a copy of the platform
+        // SessionId. Only an explicit BusinessSessionId can establish a binding.
+        if ((businessUserId && !record.businessUserId) || (businessSessionId && !record.explicitBusinessSessionId)) {
+          record = { ...record,
+            ...(businessUserId && !record.businessUserId ? { businessUserId } : {}),
+            ...(businessSessionId && !record.explicitBusinessSessionId ? { explicitBusinessSessionId: businessSessionId } : {}) };
+          await registry.write(record);
+        }
         if (record.versionId !== runtime.identity.versionId) {
           // Keep the immutable session identity, refresh only the version that
           // currently serves it so later payloads describe the running Host.
@@ -69,6 +91,8 @@ export async function createManagedRuntimeActions({ ctx, runtime, admit, model, 
         if (await controller.projections({ sessionId: nativeId }, signal)) throw runtimeError('RUNTIME_SESSION_METADATA_UNAVAILABLE', 503);
         record = { format: 'agentengine.dsh-session/v1', sessionId: id, nativeSessionId: nativeId,
           versionId: runtime.identity.versionId, owner: owner.digest, userId: owner.userId,
+          ...(businessUserId ? { businessUserId } : {}),
+          ...(businessSessionId ? { explicitBusinessSessionId: businessSessionId } : {}),
           epoch: randomUUID(), phase: 'creating', createdAt: new Date().toISOString() };
         await registry.write(record);
       }
@@ -119,40 +143,79 @@ export async function createManagedRuntimeActions({ ctx, runtime, admit, model, 
   }
   return {
     setRunControl: value => { cancelSession = value.cancelSession; cancelRun = value.cancelRun; },
-    async parseResponses(payload, headers, responses, signal) {
+    async parseResponses(payload, headers, responses, signal, { runAgent = false } = {}) {
       const owner = principal(headers);
-      const approvalInput = approvalResponseItem(payload?.input);
+      // Business identity is Host authority: `responsesInput()` mints these
+      // private fields for the RunAgent action only. A direct `/v1/responses`
+      // caller cannot claim a business user or session, and the public
+      // `session_id` is never relabelled as a business session.
+      const rawBusinessUserId = runAgent ? payload?.[BUSINESS_USER_INPUT] : undefined;
+      const businessUserId = rawBusinessUserId === undefined ? undefined : businessInvocationId(rawBusinessUserId);
+      if (rawBusinessUserId !== undefined && !businessUserId) throw runtimeError('RUNTIME_BUSINESS_USER_ID_INVALID');
+      const rawBusinessSessionId = runAgent ? payload?.[BUSINESS_SESSION_INPUT] : undefined;
+      const businessSessionId = rawBusinessSessionId === undefined ? undefined : businessInvocationId(rawBusinessSessionId);
+      if (rawBusinessSessionId !== undefined && !businessSessionId) throw runtimeError('RUNTIME_BUSINESS_SESSION_ID_INVALID');
+      const publicPayload = payload && typeof payload === 'object'
+        ? Object.fromEntries(Object.entries(payload).filter(([key]) => key !== BUSINESS_USER_INPUT && key !== BUSINESS_SESSION_INPUT))
+        : payload;
+      const inputPayload = publicPayload;
+      const approvalInput = approvalResponseItem(inputPayload?.input);
       if (approvalInput) {
-        const platformId = payload?.session_id ?? payload?.conversation;
+        const platformId = inputPayload?.session_id ?? inputPayload?.conversation;
         if (typeof platformId !== 'string' || !managedSessionKey(platformId)) throw runtimeError('RUNTIME_SESSION_NOT_FOUND', 404);
         const record = await requireSession(platformId, owner);
-        const decided = responses.parse({ input: 'approval decision', stream: payload.stream,
-          session_id: record.sessionId, request_id: payload.request_id ?? `approval-${approvalInput.requestId}`,
-          ...(payload.model === undefined ? {} : { model: payload.model }) }, headers, { principal: owner.key });
-        return { ...decided, input: '', approval: approvalInput, platformSession: record, principalDigest: owner.digest };
+        const decided = responses.parse({ input: 'approval decision', stream: inputPayload.stream,
+          session_id: record.sessionId, request_id: inputPayload.request_id ?? `approval-${approvalInput.requestId}`,
+          ...(inputPayload.model === undefined ? {} : { model: inputPayload.model }) }, headers, { principal: owner.key });
+        // Resume replays the binding the original RunAgent established and omits
+        // business attribution that call never named. The invocation id is a
+        // platform correlation id, so it is always present.
+        const businessInvocation = normalizeBusinessInvocation({
+          userId: record.businessUserId, sessionId: record.explicitBusinessSessionId, requestId: decided.requestId,
+          agentId: runtime.identity.agentId, nativeSessionId: record.nativeSessionId,
+        });
+        if (requiresBusinessIdentity && !businessInvocation?.userId) throw runtimeError('RUNTIME_BUSINESS_ID_REQUIRED');
+        return { ...decided, input: '', approval: approvalInput, platformSession: record, principalDigest: owner.digest, businessInvocation };
       }
-      const input = responses.parse(payload, headers, { principal: owner.key });
+      const input = responses.parse(inputPayload, headers, { principal: owner.key });
+      const attribution = { businessUserId, businessSessionId, requireBusinessUser: requiresBusinessIdentity };
       let record;
       if (input.previous || input.sessionLabel.startsWith('conv_')) {
         record = (await registry.list()).find(item => item.nativeSessionId === input.sessionId && item.owner === owner.digest);
         if (!record) throw runtimeError('RUNTIME_SESSION_NOT_FOUND', 404);
         record = await requireSession(record.sessionId, owner);
-      } else record = await ensure(input.sessionLabel, input.sessionId, owner, signal);
+        if (businessUserId || businessSessionId) record = await ensure(record.sessionId, input.sessionId, owner, signal, attribution);
+      } else {
+        record = await ensure(input.sessionLabel, input.sessionId, owner, signal, attribution);
+      }
+      if (requiresBusinessIdentity && !record.businessUserId) throw runtimeError('RUNTIME_BUSINESS_ID_REQUIRED');
+      const businessInvocation = normalizeBusinessInvocation({
+        userId: record.businessUserId, sessionId: record.explicitBusinessSessionId,
+        requestId: input.requestId, agentId: runtime.identity.agentId, nativeSessionId: record.nativeSessionId,
+      });
+      if (!businessInvocation) throw runtimeError('RUNTIME_BUSINESS_INVOCATION_INVALID');
       await registry.request(record, input.runId, input.requestId);
-      return { ...input, platformSession: record, principalDigest: owner.digest };
+      return { ...input, platformSession: record, principalDigest: owner.digest, businessInvocation };
     },
     async checkRun(input) {
-      await requireSession(input.platformSession.sessionId, { digest: input.principalDigest });
+      const record = await requireSession(input.platformSession.sessionId, { digest: input.principalDigest });
+      if (requiresBusinessIdentity && !input.businessInvocation?.userId) throw runtimeError('RUNTIME_BUSINESS_ID_REQUIRED');
+      if ((input.businessInvocation?.userId && record.businessUserId !== input.businessInvocation.userId)
+        || (input.businessInvocation?.sessionId && record.explicitBusinessSessionId !== input.businessInvocation.sessionId)) {
+        throw runtimeError('RUNTIME_BUSINESS_SESSION_CONFLICT', 409);
+      }
     },
     authorizeCancel: (headers, target) => {
       if (principal(headers).digest !== target.principalDigest) throw runtimeError('RUNTIME_RUN_NOT_ACTIVE', 404);
     },
     responsesInput(request) {
-      const allowed = ['AgentId', 'SessionId', 'UserId', 'AccountId', 'Messages', 'ResponsesInput', 'PreviousResponseId', 'InvocationId', 'Stream', 'ApiFormat', 'Metadata', 'Model', 'Background'];
+      const allowed = ['AgentId', 'SessionId', 'UserId', 'BusinessSessionId', 'AccountId', 'Messages', 'ResponsesInput', 'PreviousResponseId', 'InvocationId', 'Stream', 'ApiFormat', 'Metadata', 'Model', 'Background'];
       if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => !allowed.includes(key))
         || (request.AgentId && request.AgentId !== runtime.identity.agentId) || (request.ApiFormat && request.ApiFormat !== 'responses') || request.Background === true) throw runtimeError('RUNTIME_RUN_INPUT_UNSUPPORTED');
       return { input: request.ResponsesInput ?? request.Messages, session_id: request.SessionId, previous_response_id: request.PreviousResponseId,
-        request_id: request.InvocationId, stream: request.Stream, model: request.Model, metadata: request.Metadata };
+        request_id: request.InvocationId, stream: request.Stream, model: request.Model, metadata: request.Metadata,
+        ...(request.UserId === undefined ? {} : { [BUSINESS_USER_INPUT]: request.UserId }),
+        ...(request.BusinessSessionId === undefined ? {} : { [BUSINESS_SESSION_INPUT]: request.BusinessSessionId }) };
     },
     async dispatch(action, request, headers, responses, signal) {
       const owner = principal(headers, request);

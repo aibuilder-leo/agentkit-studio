@@ -8,15 +8,16 @@ export const name = 'agentkit-studio-dsh-runtime';
 export const inject = ['tools', 'skills', 'studioRuntimeBridge'];
 const AGENT_REQUEST_EVENT = ['agent', 'request'].join('/');
 import { bindDshAgentRoute, executeDshResourceTool } from '@kingsoftcloud/agentkit-studio/dsh-runtime';
+import { businessInvocationFor } from './business-invocation-context.mjs';
+import { nativeMcpInvocation } from './native-mcp-invocation.mjs';
 import { resolveRuntimeBridge } from '../host/runtime-bridge.mjs';
 import { migrateLegacyCodexObservations } from './codex-observation.mjs';
 import { createDshPresentationTools } from './dsh-presentation-tools.mjs';
-import { NATIVE_DSH_TURN_CONTRACT } from '@kingsoftcloud/agentkit-harness-node/native/dsh-turn-contract';
 import { nativeA2aToolDefinitions } from '@kingsoftcloud/agentkit-harness-node/native/a2a-tools';
 import { sandboxRegistryName } from './sandbox-code-name.mjs';
 import { assertConcreteBuiltin, unavailableNodeBuiltin } from './dsh-node-builtin-catalog.mjs';
-import { installNativeBoundPolicy } from './native-bound-policy.mjs';
-import { normalizeNativeAgentPolicy } from '../native-agent-policy.mjs';
+import { STUDIO_TEAM_HOST_TOOLS } from '../studio-team-tools.mjs';
+import { executeNativeDshToolCall } from './native-dsh-tool-call.mjs';
 
 function builtinError(code, message, details = {}) {
   return Object.assign(new Error(message), { code, details });
@@ -94,7 +95,8 @@ function registerBuiltinTools(ctx, contracts, config, bridge) {
         ? nodeTools.definitions.find(definition => definition.name === String(contract.name)) : null;
       return ctx.tools.register({
         name: String(contract.name),
-        description: String(contract.description || `AgentEngine 内置 Tool：${contract.name}`),
+        description: String(formal?.name === 'browser_inspect_workspace' ? formal.description
+          : contract.description || `AgentEngine 内置 Tool：${contract.name}`),
         parameters: formal?.parameters || contract.parameters || { type: 'object', properties: {} },
         output: { schema: BRIDGED_OUTPUT_SCHEMA, render: renderBridgedOutput },
         execute: async (args, exec) => bridgedOutput(await executeBuiltin(contract, args, exec)),
@@ -132,6 +134,12 @@ function registerMcpTools(ctx, contracts, config, bridge) {
         signal: exec?.signal,
         callId: exec?.callId,
         agent: exec?.agent,
+        // This plugin executes inside the engine process, where the RunAgent
+        // turn's async context no longer exists. Recover the business caller
+        // from the identity bound to this Session and forward it to MCP.
+        invocation: nativeMcpInvocation({ agent: exec?.agent, agentId: config.agentId,
+          runId: exec?.rootCallId, callId: exec?.callId,
+          business: businessInvocationFor(String(exec?.agent?.session?.id || '')) }),
       }, bridge)),
     }));
     return () => disposers.forEach(dispose => { try { dispose?.(); } catch {} });
@@ -145,6 +153,22 @@ function toolNames(values) {
     if (typeof value === 'string') return value;
     return value?.resourceId || value?.id || value?.name || '';
   }).filter(Boolean).map(String);
+}
+
+async function executeIndependentHostTool(ctx, definition, args, { agent, callId, signal }, decode) {
+  if (!definition || !agent?.session?.id)
+    return { status: 'error', content: { code: 'BOUND_TOOL_NOT_FOUND', executed: false } };
+  const preflightDefer = ctx.tools.callerOptionsContract === 'dsh.tool-batch-caller-options/v1'
+    ? 'dsh.tool-preflight-defer/v2' : undefined;
+  try {
+    const result = await executeNativeDshToolCall(ctx.tools, { name: definition.name, arguments: args, agent, callId, signal, preflightDefer });
+    if (!result.isError) return decode(result);
+    if (definition.readOnly || preflightDefer && result.preflightRejected === preflightDefer)
+      return { status: 'error', content: { code: 'HOST_TOOL_REJECTED', executed: false } };
+  } catch {
+    // A mutating call without a settled result may already have executed.
+  }
+  return { status: definition.readOnly ? 'error' : 'uncertain', content: { code: 'HOST_TOOL_OUTCOME_UNAVAILABLE' } };
 }
 
 function createToolAdapter(ctx, bindings) {
@@ -166,7 +190,7 @@ function createToolAdapter(ctx, bindings) {
     },
     async callTool(name, args = {}, { callId, signal, agent } = {}) {
       const schema = resolve(name, agent);
-      const result = await ctx.tools.execute({
+      const result = await executeNativeDshToolCall(ctx.tools, {
         callId: String(callId || `studio-tool-${Date.now().toString(36)}`),
         name: schema.name,
         arguments: args,
@@ -187,16 +211,10 @@ function createToolAdapter(ctx, bindings) {
 export function apply(ctx, config = {}) {
   const agentId = String(config.agentId || '').trim();
   if (!agentId) throw new Error('agentkit-studio-dsh-runtime: agentId is required');
-  if (config.nativeEngineContract !== undefined && (config.nativeEngineContract !== NATIVE_DSH_TURN_CONTRACT
-    || config.runtime !== 'harness' || config.local !== true)) {
-    throw Object.assign(new Error('Unsupported Native Harness engine contract'), { code: 'STUDIO_NATIVE_ENGINE_CONTRACT_UNSUPPORTED' });
-  }
-  if (config.nativeEngineContract !== NATIVE_DSH_TURN_CONTRACT
-    && config.toolContracts?.some(contract => contract.nativeMcpSchema !== undefined)) {
-    throw Object.assign(new Error('Native MCP schemas require the Native turn engine'), { code: 'STUDIO_NATIVE_MCP_SCHEMA_ENGINE_REQUIRED' });
-  }
-  if (config.local === true && config.runtime === 'harness' && config.nativeEngineContract !== NATIVE_DSH_TURN_CONTRACT)
-    throw Object.assign(new Error('Legacy Harness presets are retired; create a Native Harness session.'), { code: 'STUDIO_LEGACY_HARNESS_RETIRED' });
+  if (config.nativeEngineContract !== undefined || (config.local === true && config.runtime === 'harness'))
+    throw Object.assign(new Error('请用独立 Harness 新建会话。'), { code: 'STUDIO_LEGACY_HARNESS_RETIRED' });
+  if (config.toolContracts?.some(contract => contract.nativeMcpSchema !== undefined))
+    throw Object.assign(new Error('请重新绑定当前会话的 MCP 工具。'), { code: 'STUDIO_NATIVE_MCP_SCHEMA_ENGINE_REQUIRED' });
   const bridge = resolveRuntimeBridge(typeof ctx.get === 'function' ? ctx : undefined);
   const routeScope = bridge.createRouteScope();
   const routes = new Map();
@@ -230,65 +248,62 @@ export function apply(ctx, config = {}) {
     if (typeof ctx.effect === 'function') ctx.effect(install, 'agentkit-studio: bound skills');
     else install();
   }
-  const wholeNativeTurn = config.nativeEngineContract === NATIVE_DSH_TURN_CONTRACT;
-  const nativeToolBindings = new WeakMap();
-  const boundToolPolicy = wholeNativeTurn ? normalizeNativeAgentPolicy(config.boundToolPolicy) : null;
-  const bindNativeTools = agent => {
-    const owner = agent ?? ctx;
-    if (nativeToolBindings.has(owner)) return nativeToolBindings.get(owner);
-    // The preset is shared; tools and approval guards belong to the Agent's
-    // live scope. DSH disposes that scope with the Agent and isolates registry
-    // names between sibling Sessions, even when their workspaces are equal.
-    const toolsCtx = agent?.ctx ?? ctx;
-    const tools = bridge.createNativeTools({ ctx: toolsCtx, config, agent });
-    if (toolsCtx !== ctx && typeof ctx.effect === 'function') ctx.effect(() => () => tools.close?.(), 'agentkit-studio: Native preset tool retirement');
-    if (boundToolPolicy) {
-      const install = () => installNativeBoundPolicy(toolsCtx, boundToolPolicy,
-        (subject, toolName) => tools.policyDefinition(subject, toolName), tools.durableApproval);
-      if (typeof toolsCtx.effect === 'function') toolsCtx.effect(install, 'agentkit-studio: bound Native policy');
-      else install();
-    }
-    nativeToolBindings.set(owner, tools);
-    return tools;
-  };
-  // Preset mounting precedes Session publication. Register tools once the
-  // Session's committed directory is available, before prompt assembly.
-  if (wholeNativeTurn) {
-    ctx.on('agent/created', ({ agent }) => { bindNativeTools(agent); });
-    // Selecting a preset on an existing Session happens after agent/created.
-    // Initialize before assembly so that the first request already sees tools.
-    ctx.on('system-prompt/assemble', (_assembly, context, next) => {
-      if (context.agent) bindNativeTools(context.agent);
-      return next();
-    }, { prepend: true });
-  }
-  const builtinToolBindings = !wholeNativeTurn ? registerBuiltinTools(ctx, config.toolContracts, config, bridge) : null;
-  if (!wholeNativeTurn) registerMcpTools(ctx, config.toolContracts, config, bridge);
+  const builtinToolBindings = registerBuiltinTools(ctx, config.toolContracts, config, bridge);
+  registerMcpTools(ctx, config.toolContracts, config, bridge);
   const boundToolAdapter = createToolAdapter(ctx, [...toolNames(config.toolBindings),
-    ...(!wholeNativeTurn && config.a2aBindings?.length ? nativeA2aToolDefinitions().map(tool => tool.name) : [])]);
+    ...(config.a2aBindings?.length ? nativeA2aToolDefinitions().map(tool => tool.name) : [])]);
+  const service = config.runtime === 'native-engine';
+  const a2aNames = new Set(nativeA2aToolDefinitions().map(tool => tool.name));
+  const a2aHostTools = service && config.a2aBindings?.length
+    ? builtinToolBindings?.definitions.filter(tool => a2aNames.has(tool.name)) ?? [] : [];
+  const browserHostTool = service && toolNames(config.toolBindings).includes('browser_inspect_workspace')
+    ? builtinToolBindings?.definitions.find(tool => tool.name === 'browser_inspect_workspace') : undefined;
+  const teamRole = service && config.teamRole === true;
+  const teamHostTools = agent => (ctx.tools.schemas?.(agent) ?? []).filter(tool => Object.hasOwn(STUDIO_TEAM_HOST_TOOLS, tool.name))
+    .map(tool => ({ ...tool, readOnly: STUDIO_TEAM_HOST_TOOLS[tool.name] }));
   const toolAdapter = config.runtime === 'codex'
-    ? { ...boundToolAdapter, ...createDshPresentationTools(ctx) } : boundToolAdapter;
-  // Legacy resource adapters retain their existing per-model-step ownership.
-  // Local AgentKit Harness is claimed above at the whole-turn boundary.
+    ? { ...boundToolAdapter, ...createDshPresentationTools(ctx) }
+    : a2aHostTools.length || browserHostTool || teamRole ? {
+      ...boundToolAdapter,
+      ...(browserHostTool ? {
+        nativeBrowserTool: browserHostTool,
+        callNativeBrowserTool: (args, options) => executeIndependentHostTool(ctx, browserHostTool, args, options, result => {
+          const content = JSON.parse(result.value.result);
+          if (!content || typeof content.ok !== 'boolean') throw Error('Browser tool outcome invalid');
+          return { status: content.status === 'uncertain' ? 'uncertain' : content.ok ? 'ok' : 'error', content };
+        }),
+      } : {}),
+      ...(a2aHostTools.length ? {
+        listNativeA2aTools: () => a2aHostTools,
+        ...(builtinToolBindings.observeA2aReceipt ? {
+          observeNativeA2aReceipt: ({ agent, ...request }) => {
+            const session = agent?.session;
+            if (!session?.id || stopped) return {};
+            return builtinToolBindings.observeA2aReceipt({ ...request, sessionId: session.id,
+              assertCurrent: () => !stopped && agent.session === session && session.id === request.sessionId }, session.header?.cwd);
+          },
+        } : {}),
+        callNativeA2aTool: (name, args, options) => executeIndependentHostTool(ctx,
+          a2aHostTools.find(tool => tool.name === name), args, options, result => {
+            if (typeof result.value?.result !== 'string') throw Error('A2A tool outcome invalid');
+            const content = JSON.parse(result.value.result);
+            return { status: content?.status === 'uncertain' ? 'uncertain' : content?.ok === false ? 'error' : 'ok', content };
+          }),
+      } : {}),
+      ...(teamRole ? {
+        listNativeTeamTools: teamHostTools,
+        callNativeTeamTool: (name, args, options) => executeIndependentHostTool(ctx,
+          teamHostTools(options.agent).find(tool => tool.name === name), args, options,
+          result => ({ status: 'ok', content: result.content })),
+      } : {}),
+    } : boundToolAdapter;
   const nativeTools = config.local === true && config.runtime !== 'codex';
-  if (wholeNativeTurn) ctx.on('agent/execute-turn', async payload => {
+  if (service) ctx.on('agentkit/harness-resource-binding', () => {
     assertResources('Native Harness 资源恢复失败，请修复绑定后重试');
     if (stopped) throw Object.assign(new Error('Studio preset scope was retired'), { code: 'STUDIO_PRESET_SCOPE_CLOSED' });
-    return bridge.executeNativeTurn({ ...payload, binding: { agentId, runtime: config.runtime, local: true,
-      buildId: config.buildId, agentRevision: config.agentRevision, nativeEngineContract: config.nativeEngineContract,
-      boundToolPolicy, nativeTools: bindNativeTools(payload.agent) } });
+    return { agentId, agentRevision: config.agentRevision, buildId: config.buildId, scopedPresetId: config.scopedPresetId };
   });
-  // Trusted Host queries this ephemeral binding through agentEvents(ctx, agent).
-  // Durable ownership grants no tools or permissions by itself.
-  if (wholeNativeTurn) ctx.on('agentkit/native-recovery-binding', async ({ agent }) => {
-    assertResources('Native Harness 资源恢复失败，请修复绑定后重试');
-    if (stopped) throw Object.assign(new Error('Studio preset scope was retired'), { code: 'STUDIO_PRESET_SCOPE_CLOSED' });
-    const tools = bindNativeTools(agent);
-    return { agentId, runtime: config.runtime, local: true,
-      agentRevision: config.agentRevision, ...(config.buildId ? { buildId: config.buildId } : {}),
-      nativeEngineContract: config.nativeEngineContract, boundToolPolicy, nativeTools: tools };
-  });
-  if (!wholeNativeTurn && config.local === true && config.a2aBindings?.length) ctx.on('agentkit/dsh-a2a-binding', async () => {
+  if (config.local === true && config.a2aBindings?.length) ctx.on('agentkit/dsh-a2a-binding', async () => {
     assertResources('A2A resources unavailable');
     if (stopped) throw Object.assign(new Error('Studio preset scope was retired'), { code: 'STUDIO_PRESET_SCOPE_CLOSED' });
     return { contract: 'agentkit.studio-dsh-a2a-binding/v1', agentId, runtime: config.runtime, local: true,
@@ -300,7 +315,6 @@ export function apply(ctx, config = {}) {
   // recover this Agent's runtime and Tool adapter by session id.
   ctx.on(AGENT_REQUEST_EVENT, async (payload, next) => {
     assertResources('此会话的 Agent 资源恢复失败，请检查资源配置后重新选择 Agent 或重新打开应用');
-    if (wholeNativeTurn) throw Object.assign(new Error('此 Harness 必须通过整轮执行接口运行，请安装兼容的 Studio Host'), { code: 'STUDIO_NATIVE_WHOLE_TURN_REQUIRED' });
     const resolved = await next();
     if (stopped) throw Object.assign(new Error('Studio preset scope was retired'), { code: 'STUDIO_PRESET_SCOPE_CLOSED' });
     if (config.runtime === 'codex' && config.local === true) migrateLegacyCodexObservations(payload?.agent?.session);

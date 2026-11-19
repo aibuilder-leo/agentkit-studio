@@ -1,12 +1,114 @@
 # Changelog
 
-## Unreleased
+## 0.0.19 - 2026-11-19
+
+### 修复
+
+- **`supportsStore` 按线路条件设置**：0.0.18 把它写在每条路由的 `compat` 上，而它是 `openai-completions` 独占的键。profile 声明 `protocol: openai-responses` 时，DSH 直接拒绝整个模型配置：
+
+  ```
+  llm-pi-ai: provider "agentkit-studio-default" sets compat "supportsStore",
+  but no model on the route speaks a protocol that takes it;
+  it exists on openai-completions
+  ```
+
+  也就是说 0.0.18 加的 Responses 支持救不了自己 —— 切到 Responses 反而保存不了配置。现在两个 bridge 都只在 `openai-completions` 线路上发这个键；`supportsDeveloperRole` 不受影响。新增两条测试钉住分界（Responses 线路断言该键不存在，chat 线路断言存在），回滚修复会让前者变红。
+
+### 说明
+
+- 0.0.18 的 npm 包与桌面端候选都含此缺陷。不声明 `protocol` 的 profile 不受影响（仍走 Chat Completions），本补丁只为让 Responses 线路可用。
+
+## 0.0.18 - 2026-11-19
+
+### 功能：模型线路与推理档位
+
+- 模型设置新增「DSH 接口」探测：星流的 `/v1/models` 不声明任何能力位（没有 `native_endpoints`，没有 Responses 支持标记），所以表单改为**问一下**——「探测接口」按钮发一个最小的 Responses 请求，**只把 404 判为「只支持 Chat」**，超时 / 401 / 5xx 一律「无结论」，绝不可达的网关写成事实。判定后给出「让 DSH 走 Responses」或「改回 Chat Completions」的一键应用，探测本身只读、不写配置。配套 `scripts/verify-model-wire.mjs` 报告整个网关。
+- `providerWireApi()` 让 DSH 路由跟随 profile 的 `protocol` 声明。**`codexApi` 刻意不参与**：它是「Codex 模型接口」选择器且默认 `responses`，拿它定 DSH 线路会把所有 profile 翻到 42/59 模型 404 的线上——这正是这个方向之前被回退的原因。
+- 推理档位表按实测修正：`ksyun` / `deepseek` 从 `low/high/max` 改为 `low/medium/high/xhigh/max`（7 个模型 × 2 条线实测，`low` 到 `max` 全部 200），选择器补上「中」「极高」。`minimal` 明确排除——`glm-5.3` 把它当「关闭思考」直接拒，`kimi-k3.1-pro` 在 Chat 线接受、Responses 线拒绝。
+- 新增 `scripts/verify-model-efforts.mjs` 逐模型逐档探测实际可用的推理级别。
+- profile `compat` 补上 `supportsStore: false`：代理是无状态的（`previous_response_id` 直接被拒），只实现旧请求形状的网关（LiteLLM 一类）可以白拿这个键的移除。
+
+### 修复
+
+- **不再把 `developer` 角色发给网关**：OpenAI 接受两种拼写，但多数 OpenAI 兼容网关只实现 `system`，收到 `developer` 回 `400 Invalid request: role 'developer' is not allowed`。代理在发送前统一改写，DSH provider 声明 `compat: { supportsDeveloperRole: false }` 让 pi-ai 一开始就发 `system`。
+- **路由默认值不再落到目录里的 sibling 模型**：目录路由把每个模型都发布成 sibling，而 DSH 把路由级 `reasoning` 默认值应用到全部模型；配过 `reasoning: max` 的 profile 切到 `kimi-k3.1-pro-highspeed` 这类模型时，每一轮都在请求离开 DSH 之前以 `UNSUPPORTED_REASONING_EFFORT` 失败。默认值现在只写给独占路由，且默认思考等级写到「默认模型选择」而不是继承上一个 profile 残留的值。
+- 注册 `models/probe` 与 `models/wire` 两个控制端点：`models/wire` 一路实现到 RPC 却没进白名单，按钮点下去只回「无效 Server Action」；`models/probe`（「读取模型」）从引入起就一直没注册过。
+- 恢复原生会话里的 Codex 工具卡片。
+- 恢复 ManagedRuntime Agent 的云端会话，并把 Harness 引擎启动契约转发给 Host 子进程。
+- Studio 卸载时取消默认 bundle 的定时器；首次引导中的 profile 不再被默认 bundle 对齐抢写。
+
+### 测试
+
+- 新增 `control-endpoint-registration`：对比浏览器 `studioCall` 字面量与 `STUDIO_OPERATION_IDS`，把「调用了但没注册」变成门禁失败（手动回滚注册验证过两个用例都会红）。
+- 新增 `verify-studio-model-settings-web.mjs`：真实浏览器打开隔离 Studio web，断言推理档位选择器渲染全部五档、「探测接口」按钮可达、判定回显、无 console 错误（7/7）。
+- 生命周期验收改在 `AGENTKIT_STUDIO_DEFAULT_BUNDLES=0` 下跑，默认 bundle 对齐不再是插件自有状态。
+
+### 已知问题
+
+- 星流 59 个模型里只有 17 个实现 `/v1/responses`，其余 42 个（图像 / 视频 / 语音 / embedding）会 404；`providerWireApi` 因此只按显式 `protocol` 走 Responses，未声明的 profile 保持 Chat Completions 不变。
+- `qwen3.7-plus` 拒绝 `xhigh` / `max`，但它的 400 报文含 `reasoning_effort`，会命中代理的自动降级重试；精确档位请用 `scripts/verify-model-efforts.mjs` 逐模型确认。
+- 桌面端自动更新在有运行中任务时，第一次安装可能被 Squirrel 的 ShipIt 以 `App Still Running Error` 放弃；升级前先停掉运行中的任务。
+
+## 0.0.17 - 2026-11-17
+
+### 修复：恢复 0.0.16 丢失的功能
+
+- 模型与凭证设置的「请求预算与请求头」回到界面：按模型配置最大输出 Token、上下文窗口、请求超时（毫秒）与自定义请求头（可增删的键值行）。请求头随「读取模型」的目录读取一起发送（配置的 `Authorization` 优先于凭证生成的 Bearer），名称按 RFC 7230 token 校验、值拒绝换行等控制字符，空行与重复名称在保存时丢弃；预算必须是大于 0 的整数，留空沿用网关默认值。字段随 `modelProfiles` 持久化，`config.yaml` 与导出的运行包往返都保留。
+- 恢复经 magpie 等严格网关的 `400 Invalid assistant message: content or tool_calls must be set` 与 `400 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'` 修复：发送前丢弃只有推理的轮次、既无文本也无工具调用的空 assistant 轮次，以及孤立的工具回执（回执与调用按 `call_id` 配对），两者都只在网关拒绝后重试一次。
+- 流式 Action（`RunAgent` 等 SSE 接口）恢复按真实状态码抛 `AgentEngineError`：网关返回 `{ Code, RequestId, Error }` 信封或非 `text/event-stream` 响应时（429 → `SERVER_RATE_LIMITED`，信封错误 → `SERVER_ACTION_FAILED`，其余 → `SERVER_INVALID_RESPONSE`），不再显示为 SSE 解析失败或卡住。
+- 恢复共享的请求头校验契约（`HEADER_NAME` / `HEADER_VALUE` / `HEADER_LIMITS` / `headerEntryProblem` / `requestHeaders`）与 `modelRuntimeOptions` 的 `headers` 投影；`config.yaml` 层同样校验（64 条上限、大小写去重、空表删除字段）。
+- 以上功能由 #176 引入、被 #177（文档站）在 rebase 时整片回滚；本次从 #175 逐字恢复 10 个源文件与 6 个测试文件（108 个用例）。
+
+### 功能
+
+- Studio 默认启用两个官方 bundle：「自定义插件索引」与 Computer Use（`@deepseek-ai/dsh-cua-bundle`）。Host 首次以某个 DSH 版本启动时按 profile 对齐一次——随包安装的直接 `setBundleEnabled`，按需安装的先安装再启用；同一版本内不重复应用，用户关闭后不会被重新打开，`AGENTKIT_STUDIO_DEFAULT_BUNDLES=0` 可整体关闭。
+
+- 删除 Studio 自建的插件市场，插件市场交还 DSH 官方：移除「插件市场」`plugins.item` 行、发现插件 UI、`studio-plugins` 适配层、npm 搜索 + GitHub 搜索聚合（一次市场页从 16 个外部请求、最坏 24 s 降到「每个索引源 1 次 GET」）及 `plugins/dsh-*` 控制端点。市场现在是官方「插件」页的「已安装 / 发现」两个 tab，索引由 Host 的 `pluginMarket` 服务读取；Studio 只保留随包内置的社区插件索引（`pnpm build:plugin-index` 生成、`pnpm check:plugin-index` 在 CI 校验，Host 在 `/api/agentkit.plugin-market/index.json` 提供给官方读取器）并在 profile 没有索引源时添加为默认源。
+
+### 已知问题
+
+- 桌面端自动更新在**有运行中任务**时，第一次安装可能被 Squirrel 的 ShipIt 以 `App Still Running Error` 放弃：ShipIt 只等约 3.4 秒，而「退出 AgentKit Studio？当前正在运行的任务将会中断」确认弹窗会吃掉这个窗口。**升级前先停掉运行中的任务**即可一次成功；第二次点击时更新包已在 `pending/` 缓存里，会直接安装完成。上游修复见 [Squirrel.Mac#339](https://github.com/Squirrel/Squirrel.Mac/pull/339)。
+
+## 0.0.16 - 2026-11-17
+
+- Star Harness 使用 Studio 随包发布的固定摘要校验运行时及其依赖，通过校验后再启动。插件只接管已绑定的工作区。
+
+- 流式 Action（`RunAgent` 等 SSE 接口）不再把「HTTP 200 + JSON 错误信封」当成事件流：网关在流式接口上返回 `{ Code, RequestId, Error }`（例如 `Code: 409` 运行时就绪）或非 `text/event-stream` 的响应时，客户端按真实状态码与 `requestId` 抛出 `AgentEngineError`（429 → `SERVER_RATE_LIMITED`，信封错误 → `SERVER_ACTION_FAILED`，其余 → `SERVER_INVALID_RESPONSE`），界面显示真实原因而不是 SSE 解析失败或卡住；未带 content-type 的响应保持原有行为，KOP inner-account 403 回退不变。
+
+- 修复经 magpie 等严格网关时的 `400 Invalid assistant message: content or tool_calls must be set`：Responses 线只接受「带文本的 assistant 消息」或「带工具调用」的轮次，而重放的 `reasoning` 项会在模型上一轮没有产出文本与工具调用时形成只有推理的轮次。代理现在把这种轮次的 `reasoning` 项整体丢弃（有文本或工具调用的轮次保持原样，推理连续性不变），并顺手丢弃既无文本也无工具调用的空 assistant 轮次；两者都只在网关拒绝后重试一次。此前「去掉 `content: null` 再重试」的修复对这类请求是无效的（重试体同样被拒）。同一条链路上还会出现 `400 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`（历史里只剩工具回执、对应调用已被裁掉）：代理现在同样在发送前丢弃孤立回执，回执与调用按 `call_id` 顺序配对。
+
+- 模型与凭证设置的「高级」段新增默认收起的「请求预算与请求头」：按模型配置最大输出 Token、上下文窗口、请求超时（毫秒）与自定义请求头（可增删的键值行）。请求头随「读取模型」的目录读取一起发送（配置的 `Authorization` 优先于凭证生成的 Bearer，不同请求头各自读取一次目录），名称按 RFC 7230 token 校验、值拒绝换行等控制字符，空行与重复名称在保存时被丢弃，全部清空即移除该字段；预算必须是大于 0 的整数，留空沿用网关默认值。字段随 `modelProfiles` 持久化，`config.yaml` 与导出的运行包往返都保留；未配置时请求与历史行为完全一致。
+- 托管 `RunAgent` 用平台 `SessionId` 继续同一会话；可选的 `UserId` 和 `BusinessSessionId` 分别透传为绑定 MCP 工具的 `businessUserId` 和 `businessSessionId`，通过 `_meta` 和 HTTP 头发送。业务归属不参与平台鉴权，也不进入模型请求或 transcript。`AGENTKIT_MCP_BUSINESS_IDENTITY=require` 只要求业务用户；旧记录中从平台会话复制的业务 ID 不再发送。详见 `docs/mcp-invocation-identity.md`。
+
+
+- 升级 Studio Harness 到 0.0.25：原生消息保留已发送图片与纯图片消息（缩略图、放大、历史刷新），纯回答的每轮耗时改用已提交起止时间；新增转发事件唤醒与浏览器绘制合并，真实模型正文更新可测量。
+- 多工作区独立 Harness：Studio 按会话持久化的工作区各自连接独立 Harness 服务，切换 Alpha/Beta 后模型、工作目录和历史跟随各自服务；未绑定目录明确拒绝，不回落到其他项目。
+- 移除生产进程内 Harness：删除进程内 Harness 启动、执行/工具工厂桥、旧 `sessions/native-*` 控制入口和三个 bundledDependencies，执行只走独立服务或显式外部命令；锁定 npm Harness Core/Node/UI 0.0.25（同步 lockfile、Core override 与逐文件 registry pins）。
+- 交互修复：显式依赖完整会话展示接口，移除重复引擎 iframe；过程默认折叠、用量保留在输入框底部、失败以中性色摘要展开查看完整原因；保留带请求身份、游标和偏移的正文增量、图片能力握手、按账本期限等待重试和按请求回执去重的用户气泡；独立引擎读取搜索提供方配置，未配置时不向模型提供无效的 `web_search`；Ezone 安装超时由独立进程组监管。
+- 验证：三个 npm 包均核对发布来源和归档摘要，安装后校验 541 个 Harness 文件与 551 个 Studio 归档文件；真实打包 Studio 使用 DeepSeek V4.1 Flash 完成联网搜索，只有一个 Native 视图，升级前后 45 个 Run 记录逐一保持不变。
+- 发布门禁跟上新的 Agent 列表交互：「手动配置」改为从「更多创建方式」菜单进入，运行时改由 radiogroup 选择，客户端页面验收重新走通创建与编辑绑定流程。
+
+## 0.0.15 - 2026-11-16
+
+- Studio 连接独立 Harness 服务并恢复任务投递：原生会话、Team 角色和绑定的 A2A 任务都交给独立服务执行，审批决策、排队引导和原始 A2A receipt 随 Run 回传；桌面端重新连回原始 Run 与 A2A receipt，任务进度和交付网站在侧栏直接打开。浏览器工具改走 Host 批处理执行器，启动错误与匿名轮次分开处理，折叠的失败轮次在 hydration 后仍能展开；托管 transport 边界与 Run 引擎补齐集成测试。Studio 固定已发布的 Harness 0.0.20 包。
+- ManagedRuntime 统一交付 Studio bundle：portable bundle 改用托管 MCP 的 env 名，云端资源跳过托管 bundle 上传；CI 复用 Playwright Chromium 缓存。
 
 - 托管运行时把 `AGENTKIT_CODEX_*` 调整项（`TIMEOUT_MS` / `IDLE_TIMEOUT_MS` / `STREAM_IDLE_TIMEOUT_MS` / `MODEL_IDLE_TIMEOUT_MS` / `MODEL` / `SANDBOX` / `APPROVAL_POLICY` / `REASONING_SUMMARY`）加入 Host 子进程的 env 白名单：之前 `codex-runtime` 会读这些变量，但白名单没放行，长任务的超时预算实际上是硬编码的，只能靠发新镜像调整。
 - 托管 DSH 的 Hosted UI 会话注册表改为 **Agent 作用域**（`<state>/managed-sessions`），不再放在版本目录下：此前每次被接受的 UpdateAgent 都会换到一个空的注册表目录，Hosted UI 于是列不出、也打不开更新前的会话，尽管 DSH 原生 transcript 一直保留。首次启动会把最近写入的一份旧版本注册表复制过来（旧目录保留供旧镜像回滚），`AGENTKIT_MANAGED_SESSIONS` 由 Host 显式导出，未提供时回退到旧的版本目录。
+- 一个 Agent 的 DSH home、用户 home 与工作区跨部署版本保持：只有不可变 receipt 和导入的 running bundle 按版本隔离，接受 UpdateAgent 后不再从空的 DSH home 启动；最近一份带会话状态的旧版本目录用硬链接一次性接管（源目录原样保留供回滚），profile marker 改用 Agent 身份。
+- 从 Agent 作用域会话注册表解析资源身份：Host 同时读取 `AGENTKIT_MANAGED_SESSIONS`，版本目录只在未显式提供路径时回退，并加 wiring guard 防止两份注册表再次漂移，修复更新后 Hosted UI 列得出会话却以 `MANAGED_RESOURCE_IDENTITY_UNAVAILABLE` 失败。
+- Codex 多轮 400 修复：`local_shell_call` 与其输出现在参与 Responses→Chat 转换，缺失 `call_id` 的输出按顺序与待处理调用配对；重放的 reasoning item 原样转发，只有 provider 真的拒绝时才去掉 `content: null` 重试一次，未相关的 400 保持原样。超出 yield 预算的命令按运行中继续（带 `sessionId`），并观察 `write_stdin` 输出，长命令不再以 `RUNTIME_RUN_FAILED` 收场。
+- 资源重试与 MCP 会话恢复落地第一批安全修复：托管 Memory 写入不再自动重试，MCP 首次并发建连使用 single-flight，已有 session 明确返回「session not found」时清理缓存并重建、最多重放一次；资源事件、UI 动作与 safe-read 仍按后续阶段验收。
+- 恢复冻结 host 的 MCP 轮次并延长 deadline：冻结运行时请求预算改为 15 分钟（`AGENTKIT_RUNTIME_TIMEOUT_MS` 可调），首次 turn 的 schema 以冻结契约为准，不再因预设晚挂载丢工具或整轮失败。
+- 浏览器 bundle 尺寸预算成为门禁：`scripts/verify-client-modules.mjs` 接入 `pnpm check`，基线与其允许增量一起入库；只统计 allowlist 之外的 `node_modules` 输入，第三方包内部循环降级为报告，Studio 自身模块必须无环。
+- 部署面展示冻结运行时镜像 tag：部署记录的 meta 行与详情显示镜像 tag，更新检查预览拆成当前镜像与目标镜像（tag + digest），只改展示不改部署行为。
 - MCP 资源页的「认证 Header / 环境变量凭证」改为可折叠的进阶区块：默认收起，识别到自定义 Header 时自动展开；仍可直接填 Header 名称与凭证名称添加凭证行。JSON 输入框随内容自动增高，多服务配置不再挤在 5 行里。
 - 修复浅色主题下主按钮 hover 时文字不可见：全局 hover 规则不再把白色标签的主按钮改成浅色底，`.sq-btn.primary` 等类样式按钮与凭据引导弹窗一并覆盖；禁用态主按钮的标签改用次要文字色。
 - 新建 Agent 默认运行时改为 DSH Native，并在创建流程中暂时隐藏 Star Harness（编辑既有 Star Harness Agent 不受影响），待该运行时稳定后再开放创建。
+- Studio 界面按 DSH 设计系统统一：Agent 表单改用共享表单原语并合并为三步（运行时在绑定能力之前选择，切换不再静默重置已绑工具），Agent 列表入口页改为分段控件加「更多创建方式」菜单，资源库、交付与运行中心等页面统一 DSH 设计 token；macOS 图标按 Apple 824px 网格留白，Windows 使用全出血图标。
+- 桌面端本地 Host 认证与 Chromium 隔离，并用 bundled pnpm 恢复插件 profile；专家分组以原生 DSH team 运行，冷启动 team 保留 native lead；Codex reasoning 与托管会话正确渲染；预留 native team 工具与默认模型；Agent 会话绑定到作用域 preset；恢复打包技能与托管运行时管理。
+- 保留被拒绝的上游请求的诊断信息（原始 name、数字 code、受限 message 与调用点），run 失败在 code 归一化前记录原始信息；长 AbortSignal 截止时间在进程入口与创建时追踪并记录 abort 来源；组合后的 Agent preset 日志让 bash 超时能点出具体工具。CI 的 mounted Studio Native Host proof 改为非门禁项。
+- 重新固定官方 DSH Windows 安装器摘要。
 
 ## 0.0.14 - 2026-11-10
 

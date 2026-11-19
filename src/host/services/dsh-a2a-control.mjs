@@ -5,6 +5,7 @@ import { canonical, copy, invariant, parseNativeJson } from '@kingsoftcloud/agen
 import { awaitA2aControl } from '../../providers/native-a2a-controls.mjs';
 import { requestStudioA2aApproval } from './a2a-control-approval.mjs';
 import { a2aDecisionDigest } from '../../providers/native-a2a-decision.mjs';
+import { isRoutableRuntimeType } from '../../runtime-contract.mjs';
 const id = value => typeof value === 'string' && value.trim() && value.length <= 256;
 export function validateDshA2aRequest(request, control = false) {
   const allowed = control ? ['agentId', 'sessionId', 'agentRevision', 'buildId', 'operationKey', 'callId', 'kind', 'commandId', 'parts', 'json', 'pauseDigest']
@@ -24,7 +25,7 @@ export function validateDshA2aRequest(request, control = false) {
     && (request.inventoryDigest === undefined || typeof request.inventoryDigest === 'string' && /^[a-f0-9]{64}$/u.test(request.inventoryDigest)),
   'STUDIO_DSH_A2A_REQUEST_INVALID');
 }
-export function createStudioDshA2aControls({ ctx, agentEvents, signal: hostSignal }) {
+export function createStudioDshA2aControls({ ctx, agentEvents, resolveManagedBinding, signal: hostSignal }) {
   const lifetime = new AbortController(), active = new Set();
   function run(request, callerSignal, control) {
     validateDshA2aRequest(request, control);
@@ -46,12 +47,14 @@ export function createStudioDshA2aControls({ ctx, agentEvents, signal: hostSigna
           && ctx.get('sessionProjections')?.stateOf?.(session, 'agentPreset') === presetId, 'STUDIO_DSH_A2A_IDENTITY_CONFLICT');
         return true;
       };
-      const binding = await awaitA2aControl(() => agentEvents(ctx, agent).serial('agentkit/dsh-a2a-binding', {}), signal);
+      const resolveBinding = async () => await resolveManagedBinding?.(original.sessionId, signal)
+        ?? await agentEvents(ctx, agent).serial('agentkit/dsh-a2a-binding', {});
+      const binding = await awaitA2aControl(resolveBinding, signal);
       assertCurrent();
       if (!binding && !control) return { contract: 'agentkit.studio-dsh-a2a-inventory/v1', applicable: false,
         agentId: original.agentId, sessionId: original.sessionId, items: [], complete: true, offset: 0, total: 0 };
       invariant(binding?.contract === 'agentkit.studio-dsh-a2a-binding/v1' && binding.local === true
-        && ['dsh-native', 'harness', 'codex'].includes(binding.runtime) && binding.agentId === original.agentId
+        && isRoutableRuntimeType(binding.runtime) && binding.agentId === original.agentId
         && Number.isSafeInteger(binding.agentRevision) && binding.agentRevision > 0
         && (binding.buildId === null || id(binding.buildId)), 'STUDIO_DSH_A2A_BINDING_CHANGED');
       const tools = binding.tools;
@@ -59,7 +62,7 @@ export function createStudioDshA2aControls({ ctx, agentEvents, signal: hostSigna
         invariant(typeof tools?.a2aTaskHistory === 'function', 'STUDIO_DSH_A2A_UNAVAILABLE');
         return tools.a2aTaskHistory({ sessionId: original.sessionId, ...(original.offset !== undefined ? { offset: original.offset } : {}),
           ...(original.limit !== undefined ? { limit: original.limit } : {}),
-          ...(original.inventoryDigest !== undefined ? { inventoryDigest: original.inventoryDigest } : {}) }, assertCurrent);
+          ...(original.inventoryDigest !== undefined ? { inventoryDigest: original.inventoryDigest } : {}) }, assertCurrent, session.header?.cwd);
       }
       invariant(original.agentRevision === binding.agentRevision && original.buildId === binding.buildId
         && typeof tools?.controlA2aTask === 'function', 'STUDIO_DSH_A2A_BINDING_CHANGED');
@@ -87,7 +90,7 @@ export function createStudioDshA2aControls({ ctx, agentEvents, signal: hostSigna
           // not service identity. Recheck availability, policy and the exact
           // preset/tool binding after the durable approval instead.
           invariant(typeof ctx.get('approval')?.request === 'function', 'STUDIO_DSH_A2A_PERMISSION_UNAVAILABLE');
-          const current = await awaitA2aControl(() => agentEvents(ctx, agent).serial('agentkit/dsh-a2a-binding', {}), signal);
+          const current = await awaitA2aControl(resolveBinding, signal);
           assertCurrent(); invariant(current?.tools === tools && current?.contract === binding.contract
             && current?.agentId === binding.agentId && current?.agentRevision === binding.agentRevision
             && current?.buildId === binding.buildId && current?.runtime === binding.runtime && current?.local === true,
@@ -96,7 +99,7 @@ export function createStudioDshA2aControls({ ctx, agentEvents, signal: hostSigna
             commandDigest: a2aDecisionDigest(command), receipt: outcome.receipt };
           return outcome === 'allowed-once' ? 'allow' : 'deny';
         },
-      }), signal);
+      }, session.header?.cwd), signal);
     })();
     active.add(task); void task.finally(() => active.delete(task)).catch(() => {}); return task;
   }

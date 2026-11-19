@@ -62,7 +62,7 @@ test('historical preset recovery does not wait for new-session model admission',
     build: { list: async () => [] }, admission,
   });
   await new Promise(resolve => setImmediate(resolve));
-  const recoveredWhileValidationPending = records.every(row => presets.has(dshPresetId(row.metadata.id, 1)));
+  const recoveredWhileValidationPending = records.every(row => presets.has(dshPresetId(row.metadata.id, 1) + '-harness-service'));
   release();
   await recovery;
   try {
@@ -110,4 +110,40 @@ test('a replacement registry recovers while the retiring registry is still settl
   assert.deepEqual(admitted, [row.metadata.id]);
   release();
   await old;
+});
+
+test('recovery restores the independent route and legacy IDs can only use it', async () => {
+  const row = {
+    metadata: { id: 'ar-local-0123456789abcdef', revision: 2, local: true },
+    spec: { runtime: { type: 'harness' }, bindings: { tools: ['read_workspace_file', 'run_command', 'component_status'] } },
+  };
+  const presets = new Map();
+  const legacy = { provider: 'legacy', model: 'configured' };
+  const modelSelection = { provider: 'harness-service', model: 'Harness' };
+  const workspaceRoot = '/workspace/native-agent';
+  const admission = new DshPresetAdmission({
+    getAgent: async () => row,
+    getModelSelection: async () => legacy,
+    resolveHarnessWorkspace: () => ({ workspaceRoot, modelSelection }),
+    registry: { register: async preset => { presets.set(preset.id, preset); return () => presets.delete(preset.id); } },
+  });
+  try {
+    await restoreLocalPresets({
+      store: { list: async () => [row], captureRevision: async () => {}, listRevisions: async () => [row] },
+      build: { list: async () => [] }, admission,
+    });
+    const id = dshPresetId(row.metadata.id, 2);
+    const original = await admission.ensure(row.metadata.id, { requestedPresetId: id });
+    const service = await admission.ensure(row.metadata.id, { cwd: workspaceRoot });
+    assert.deepEqual([...presets.keys()], [service.presetId, id]);
+    assert.equal(original.runtime, 'native-engine');
+    assert.deepEqual(original.modelSelection, modelSelection);
+    assert.equal(service.runtime, 'native-engine');
+    assert.equal(service.workspaceRoot, workspaceRoot);
+    assert.deepEqual(service.modelSelection, modelSelection);
+    assert.equal(service.reused, true);
+    const tools = id => presets.get(id).plugins.find(plugin => plugin.id === 'studio-runtime').config.toolBindings;
+    assert.deepEqual(tools(original.presetId), ['component_status']);
+    assert.deepEqual(tools(service.presetId), ['component_status']);
+  } finally { await admission.dispose(); }
 });

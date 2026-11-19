@@ -2,13 +2,13 @@
   "schemaVersion": 1,
   "exportFormat": 1,
   "baseCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
-  "headCommit": "ba630379855bd9fba6f1d62c9dd93ec4bfe5f70a",
+  "headCommit": "96d0cc7320eb54027c83cef7052e17f789cfcdd7",
   "branchRef": "refs/heads/codex/studio-dsh-v0.2.2-rc.1",
-  "tree": "528711c889fd7041f3caf55c9c114bdf7e5de89d",
-  "sourceSha256": "5ed309d1cff802a585331425bbd2c2ad8ee2011de149ee0416347c89245ae43b",
+  "tree": "8a42dfaba954450c981fca37b2fc77b2b20ffd60",
+  "sourceSha256": "a900a482a02f3b7087695e33d7fb3c7c236b9b1c59674f11778806decdfaca25",
   "bundle": {
     "file": "../../host-source/dsh-v0.2.2-rc.1/maintenance.bundle",
-    "sha256": "eb62e85cfe0181efb49a4ff8869cdc718308b348f7e51678af9bec0cb48fab96"
+    "sha256": "348b9ee6e4da360ddf70415618f0736ed03dc8efb6f8373a6bf91bbc22a8c94e"
   },
   "commits": [
     {
@@ -322,6 +322,24 @@
       "file": "083-desktop-host-cookie-isolation.patch",
       "commit": "ba630379855bd9fba6f1d62c9dd93ec4bfe5f70a",
       "sha256": "e903a00d71a7019eac161651f77087b2839c371bf99a64016309fe36e64d29b6"
+    },
+    {
+      "id": "084",
+      "file": "084-chat-runtime-presentation.patch",
+      "commit": "01726d5eeadedc23bd84d9515737e9a8f604f10b",
+      "sha256": "6d9f7cc2998589ccfb29fc0a78a43e7796c38a13960ae0f894b0742f0a81f15f"
+    },
+    {
+      "id": "085",
+      "file": "085-native-global-panel-right-sidebar.patch",
+      "commit": "ae7801815ef7d9b169e9a7e506c4334d9419b81f",
+      "sha256": "7380ea061ed964fe8a450749a9f22f7a4f09439834940c46bd2d8cad11bef58e"
+    },
+    {
+      "id": "086",
+      "file": "086-studio-desktop-telemetry.patch",
+      "commit": "96d0cc7320eb54027c83cef7052e17f789cfcdd7",
+      "sha256": "e8189763edffe809455b036a3201c597a140d7deb7545de2c64e4455b47a09e6"
     }
   ]
 }

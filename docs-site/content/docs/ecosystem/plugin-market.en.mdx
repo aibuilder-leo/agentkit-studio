@@ -1,0 +1,92 @@
+---
+title: Plugin market
+description: How Studio consumes DSH's official plugin index (format 1) — index sources, request model, the bundled community index, and the install path.
+---
+
+The plugin market is **DSH's official plugin index**: a static `format: 1` JSON document listing installable bundles with their title, icon, author, versions, `engines.dsh` compatibility range and install source. Studio no longer aggregates anything at request time — it reads the Host's `pluginMarket` service and, when the profile configures no index source at all, adds the community index bundled with the product as the default source.
+
+- Bundled community index: `assets/plugin-market/index.json`, served by the Host at `GET /api/agentkit.plugin-market/index.json`.
+- User index sources: they belong to the current profile and are added, removed and switched on the Discover page.
+- Installation, enable/disable, update and uninstall stay owned by the official DSH plugin manager.
+
+<Callout type="info" title="Why the aggregation is gone">
+  The previous implementation issued 16 external requests per cold load (npm search, GitHub search and 14 full packuments), serialized as badly as 24 seconds and rate-limited to 10 GitHub search requests per minute. An index puts everything a list page needs into **one document**: one GET per index source, with search, filtering, ordering and paging answered from the Host's memory.
+</Callout>
+
+## Request model
+
+| Operation | External requests |
+| --- | --- |
+| List index sources (`listIndexes`) | 0 (configuration only) |
+| First read of a source | 1 |
+| Another read within the 10-minute TTL | 0 |
+| Explicit refresh (`refresh: true`) | 1 |
+| Second page and later | 0 (the `fetchedAt` snapshot answers them) |
+| Search / filter / order | 0 (in-memory index) |
+
+Host defaults: `cacheTtlMs` 600000 (10 minutes), `fetchTimeoutMs` 15000, `maxBytes` 128 MiB, at most 100 entries per page. Documents are parsed on a Worker thread so a large index never blocks the Host event loop.
+
+## Index format
+
+Root fields: `format` (must be `1`), `title` (required, `LocalizedText`), `description`, `metadata`, `plugins[]`. Plugin fields: `name` (npm package name, unique in the document), `title`, `description`, `icon`, `author`, `homepage`, `repository`, `metadata`, `versions[]`. Version fields: `version` (exact SemVer), `publishTimestamp` (Unix seconds), `source` (`{"type":"npm"}` or `{"type":"git","url","commit","path"}`) and `engines.dsh` (a SemVer range).
+
+```json
+{
+  "format": 1,
+  "title": { "en": "DSH Community Plugins", "zh": "DSH 社区插件" },
+  "metadata": {
+    "sortKeys": { "downloads": { "title": { "en": "Downloads", "zh": "下载量" }, "order": "desc" } }
+  },
+  "plugins": [
+    {
+      "name": "dshmarket",
+      "title": { "en": "dshmarket", "zh": "dshmarket" },
+      "metadata": { "keywords": ["dsh-plugin"], "sortKeys": { "downloads": 1289262 } },
+      "versions": [
+        { "version": "1.73.20", "publishTimestamp": 1790476800, "source": { "type": "npm" }, "engines": { "dsh": ">=0.2.0" } }
+      ]
+    }
+  ]
+}
+```
+
+Members the format does not define are ignored, so it can grow without breaking readers; a malformed *defined* member rejects the **whole document** with its JSON path, so no broken entry disappears silently.
+
+## The bundled community index
+
+| File | Purpose |
+| --- | --- |
+| `assets/plugin-market/index.json` | The `format: 1` document shipped with the package and served by the Host |
+| `assets/plugin-market/sources.txt` | Generation input: one npm package name per line |
+| `scripts/build-plugin-market-index.mjs` | Generator and validator |
+
+```sh
+pnpm build:plugin-index    # regenerate (reads sources.txt; seeds the top 80 packages by downloads when empty)
+pnpm check:plugin-index    # offline; validates the committed document
+```
+
+Inclusion rule: only valid SemVer versions that were published, are not deprecated and are not private, at most 20 per plugin; output is ordered by downloads and then by name and is **deterministic** (no timestamps, no randomness), so a refresh shows up in review as data changes only.
+
+## Install path
+
+The index produces arguments; it never installs. An npm version resolves to `name@version` (with a `registry` when the document declares one), a Git version to `git+<url>.git#<commit>` (with `&path:/<dir>` for a subdirectory), and both are handed to the official `pluginManager.inspect()` / `installBundle()`, which owns the compatibility check, the build-script approval and the rollback on failure.
+
+## When it is not enabled
+
+The official index service is mounted only with the experimental bundle `@deepseek-ai/dsh-experimental-plugin-market-bundle` ("Custom plugin indexes"). Studio enables it automatically the first time a profile starts with a given DSH version (the same default list also enables Computer Use, `@deepseek-ai/dsh-cua-bundle`), so the market works out of the box; when enabling fails or the installation does not carry the bundle, the market answers `PLUGIN_MARKET_UNAVAILABLE` and offers a one-click enable action.
+
+The defaults apply once per DSH version: a person who switches a default bundle off keeps it off, a retryable failure (network, pnpm) leaves no marker so the next start retries, and `AGENTKIT_STUDIO_DEFAULT_BUNDLES=0` turns the alignment off entirely.
+
+## Security and trust
+
+An index is third-party content: titles, authors, labels and sources are declared by the document, and DSH validates its format, never its claims. An `http:` index — including the install specs it lists — can be modified in transit, so a network you do not control needs `https:`. URL icons are requested by the browser directly and expose your IP address to the image host. Check the source shown in the confirmation dialog before installing.
+
+## Source map
+
+| Concern | Where |
+| --- | --- |
+| Bundled index source (default source, document reads) | `src/plugin-market.mjs` |
+| Bundled index route | `src/host/routes/plugin-market-index.mjs` |
+| Default-enabled bundles | `src/host/default-bundles.mjs` |
+| Install / enable / update | The official `pluginManager` (Studio adds no wrapper) |
+| Index generator | `scripts/build-plugin-market-index.mjs` |

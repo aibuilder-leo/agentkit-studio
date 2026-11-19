@@ -30,7 +30,7 @@ export async function selectSessionModel(remote, request = {}) {
 
 /** Admit a revision/build through the durable DSH APIs before native navigation. */
 export function createNativeSessionBinding({ navCtx, remote, layout, hostRemote, writeConversationAgent, actions, isActive = () => true, console = globalThis.console }) {
-  let disposed = false;
+  let disposed = false, choosingWorkspace = false;
   const active = () => !disposed && isActive();
   const bindAgent = async (agentOrOptions, requestedBuildId = '') => {
     if (!active()) return;
@@ -39,17 +39,51 @@ export function createNativeSessionBinding({ navCtx, remote, layout, hostRemote,
     const buildId = String(options.buildId || '').trim();
     if (!value && options.workspaceFree !== true) return;
     try {
-      const admission = value ? await hostRemote.ensureDshPreset(value, buildId) : null;
+      const current = options.workspaceFree === true ? undefined
+        : Object.values(navCtx.sessions.list?.getSnapshot().byId ?? {}).find(session => session.retainedBy?.mainView > 0);
+      let cwd = options.cwd ?? current?.cwd;
+      let workspaceId = options.workspaceId ?? (options.cwd === undefined && current
+        ? navCtx.workspaces?.list.getSnapshot().items.find(workspace => workspace.sessionIds.includes(current.id))?.workspaceId : undefined);
+      const admit = () => value ? hostRemote.ensureDshPreset(value, buildId, undefined, cwd) : null;
+      let admission;
+      try { admission = await admit(); }
+      catch (error) {
+        if (error?.code !== 'NATIVE_ENGINE_WORKSPACE_UNAVAILABLE' || options.throwOnError || options.cwd !== undefined
+          || options.workspaceId !== undefined || typeof hostRemote.starHarnessStatus !== 'function') throw error;
+        if (!active() || choosingWorkspace) return;
+        choosingWorkspace = true;
+        try {
+          const status = await hostRemote.starHarnessStatus();
+          if (!active()) return;
+          const titles = new Map((status.workspaceChoices ?? []).map(({ path, title }) => [path, title]));
+          const choices = (status.workspaces ?? []).filter(item => item.external ? item.running : status.enabled && !item.missing).map(item => {
+            const title = titles.get(item.workspace);
+            return { value: item.workspace, label: title ? title + ' · ' + item.workspace : item.workspace };
+          });
+          if (!choices.length) {
+            const configure = await actions.confirm({ title: '选择 Star Harness 工作区',
+              detail: '请在 Studio 中添加或选择工作区，并在插件页启用 Star Harness。', confirmLabel: '打开插件页' });
+            if (configure && active()) layout.selectPanel('plugins');
+            return;
+          }
+          const selected = await actions.confirm({ title: '选择 Star Harness 工作区',
+            detail: '新会话将在所选工作区运行。', choiceLabel: 'Star Harness 工作区',
+            choicePlaceholder: '选择工作区', choices, confirmLabel: '开始对话' });
+          if (!active() || !choices.some(choice => choice.value === selected)) return;
+          cwd = selected;
+          workspaceId = navCtx.workspaces?.list.getSnapshot().items.find(workspace => workspace.path === cwd)?.workspaceId;
+          admission = await admit();
+        } finally { choosingWorkspace = false; }
+      }
       if (!active()) return;
-      // Pass the admitted preset into session creation. Creating a blank
-      // Session with the standard preset and then recomposing it through
-      // `agentPresets.select` leaves the standard persona mounted while the
-      // scoped persona is being installed; DSH correctly rejects that second
-      // registration. The public Session API accepts the preset at creation
-      // time and mounts only the selected composition.
-      const sessionId = await navCtx.sessions.create(admission ? { agentPreset: admission.presetId } : {});
+      // Mount the admitted persona once, as part of creating the session.
+      const sessionOptions = admission ? { agentPreset: admission.presetId } : {};
+      if (workspaceId) sessionOptions.workspaceId = workspaceId;
+      else if (cwd ?? admission?.workspaceRoot) sessionOptions.cwd = cwd ?? admission.workspaceRoot;
+      const sessionId = await navCtx.sessions.create(sessionOptions);
       if (!active()) return;
-      const modelSelection = options.modelSelection || admission?.modelSelection;
+      const modelSelection = admission?.serviceOwnedModel
+        ? admission.modelSelection : options.modelSelection || admission?.modelSelection;
       if (modelSelection) {
         const result = await selectSessionModel(remote, { sessionId, ...modelSelection, saveDefault: false });
         if (!active()) return;

@@ -30,7 +30,7 @@ async function definition(t, framework, extraEnv = {}) {
   } });
 }
 
-test('managed Harness admits usable workspace and command tools into its real preset composition', async t => {
+test('managed Harness routes native builtins to the independent runtime', async t => {
   const runtime = await definition(t, 'harness');
   let preset;
   const admission = new DshPresetAdmission({ getAgent: async () => runtime.agent,
@@ -42,14 +42,30 @@ test('managed Harness admits usable workspace and command tools into its real pr
   t.after(() => admission.dispose());
   await admission.ensure(runtime.identity.agentId);
   const plugin = preset.plugins.find(item => item.id === 'studio-runtime');
-  assert.equal(plugin.config.nativeEngineContract, 'agentkit.native-dsh-turn/v1');
-  for (const name of ['read_workspace_file', 'write_workspace_file', 'run_command', 'read_command_output']) {
-    assert.ok(plugin.config.toolBindings?.includes(name), `cloud Harness must receive ${name}`);
-    assert.ok(plugin.config.toolContracts?.some(item => item.name === name && item.executor === 'builtin'));
-  }
-  assert.ok(!plugin.config.toolBindings.includes('web_search'), 'unconfigured search is not advertised');
-  assert.ok(!plugin.config.toolBindings.includes('skill_install'), 'defaults do not grant installation');
+  assert.equal(plugin.config.runtime, 'native-engine');
+  assert.equal(plugin.config.nativeEngineContract, undefined);
+  for (const name of ['read_workspace_file', 'write_workspace_file', 'run_command', 'read_command_output'])
+    assert.ok(!plugin.config.toolBindings?.includes(name), `Harness owns ${name}`);
   assert.deepEqual(runtime.agent.bindings, runtime.agent.spec.bindings);
+});
+
+test('a managed Harness declaration can select its independent service without changing platform identity', async t => {
+  const remote = { AGENTKIT_ENGINE_SERVICE_URL: 'https://harness-service.agent-fixture.svc:8787',
+    AGENTKIT_ENGINE_SERVICE_TOKEN: 'fixture-service-credential', AGENTKIT_ENGINE_SERVICE_WORKSPACE: '/data/workspace' };
+  const runtime = await definition(t, 'harness', remote);
+  assert.equal(runtime.identity.runtimeName, 'harness');
+  assert.equal(runtime.agent.spec.runtime.type, 'native-engine');
+  assert.equal(runtime.agent.spec.bindings.tools, undefined, 'independent engine owns the workspace tools');
+  let preset;
+  const admission = new DshPresetAdmission({ getAgent: async () => runtime.agent,
+    registry: { register: async value => { preset = value; return () => {}; } } });
+  t.after(() => admission.dispose());
+  await admission.ensure(runtime.identity.agentId);
+  const plugin = preset.plugins.find(item => item.id === 'studio-runtime');
+  assert.equal(plugin.config.runtime, 'native-engine');
+  assert.equal(plugin.config.nativeEngineContract, undefined);
+  await assert.rejects(definition(t, 'harness', { ...remote, AGENTKIT_ENGINE_SERVICE_TOKEN: '' }),
+    { code: 'MANAGED_HARNESS_SERVICE_BINDING_INVALID' });
 });
 
 test('managed defaults never replace an explicitly selected remote command backend with local execution', async t => {

@@ -1,3 +1,4 @@
+import { STAR_HARNESS_CHANGED } from './star-harness.mjs';
 import { memorySourceContext, readAgentMemoryConfig, writeAgentMemoryConfig, validateAgentMemoryConfig, memoryRequiresCloudBinding, clampInt, clampFloat, MEMORY_WRITE_MODES, MEMORY_ROLLOUTS, MEMORY_PROVIDER_CLOUD } from '../state/agent-memory-config.mjs';
 import { createNativeRoleFields, readNativeRoleDrafts, validateNativeRoleDrafts } from './native-role-fields.mjs';
 import { nativeDefaultToolsFromCatalog } from '../../native-capability-defaults.mjs';
@@ -16,7 +17,7 @@ const ROLLOUT_DESC = { shadow: '仅评估候选策略，不写入记忆库。', 
 
 export function createAgentForm({
   ui: { React, BRAND, ALLOWED_RUNTIME_TYPES, RUNTIME_LABELS, buttonStyle, inputStyle, SectionHeading, PlatformResourcePicker },
-  hostRemote
+  hostRemote, window
 }) {
   const { createElement: h, useState, useEffect, Fragment } = React;
   const kit = createFormKit({ React });
@@ -32,7 +33,8 @@ export function createAgentForm({
     const requirements = creationSeed?.requirements || [];
     const templateSource = creationSeed?.templateSource || initialAgent?.metadata?.templateSource;
     const originalBindings = originalSpec.bindings || {};
-    const idsOf = items => (items || []).map(item => typeof item === 'string' ? item : item.resourceId).filter(Boolean);
+    const bindingId = item => typeof item === 'string' ? item : item?.resourceId || item?.id;
+    const idsOf = items => [...new Set((items || []).map(bindingId).filter(Boolean))];
     const [step, setStep] = useState(0);
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState('');
@@ -57,8 +59,25 @@ export function createAgentForm({
       id: initialAgent?.metadata?.id || 'local-agent', name: initialAgent?.metadata?.name || creationSeed?.name || '我的第一个 Agent', runtime: initialRuntime,
       description: originalSpec.description || creationSeed?.description || '', prompt: originalSpec.instructions?.system || '', template: 'blank',
     });
-    // Star Harness is paused for new Agents unless a caller explicitly opts in.
-    const creatableRuntime = type => type !== 'harness' || editing || allowHarnessRuntime;
+    const [starHarnessReady, setStarHarnessReady] = useState(false);
+    useEffect(() => {
+      if (editing || allowHarnessRuntime || !hostRemote.starHarnessStatus) return;
+      let controller;
+      const load = () => {
+        controller?.abort();
+        const request = controller = new AbortController();
+        hostRemote.starHarnessStatus({ includeWorkspaces: false }, request.signal).then(status => {
+          if (!request.signal.aborted) setStarHarnessReady(status?.canCreate === true);
+        }, () => { if (!request.signal.aborted) setStarHarnessReady(false); });
+      };
+      load();
+      window?.addEventListener(STAR_HARNESS_CHANGED, load);
+      return () => {
+        controller?.abort();
+        window?.removeEventListener(STAR_HARNESS_CHANGED, load);
+      };
+    }, [editing, allowHarnessRuntime]);
+    const creatableRuntime = type => type !== 'harness' || editing || allowHarnessRuntime || starHarnessReady;
     const runtimeOptions = [
       ...ALLOWED_RUNTIME_TYPES.filter(type => !creatableRuntime(type) || !creationSeed?.runtimes || creationSeed.runtimes.includes(type)).map(runtimeType => ({ runtimeType, displayName: RUNTIME_LABELS[runtimeType] })),
       // A cloud Agent's server-owned framework is not a local authoring
@@ -134,11 +153,12 @@ export function createAgentForm({
     const requiresCloudBinding = memoryRequiresCloudBinding({ state: { ...memoryConfig, source: effectiveMemorySource }, ctx: memoryCtx, memoryInstanceBound });
     const memoryBindingOk = !memoryEnabled || !requiresCloudBinding || memoryInstanceBound;
     const bindingReady = !missingRequirements.length && memoryBindingOk;
-    const canNext = step === 0
+    const canNext = creatableRuntime(form.runtime) && (step === 0
       ? Boolean(form.id.trim() && form.name.trim())
-      : cloudEditing || (catalogStatus === 'ready' && Boolean(selectedModel) && bindingReady);
+      : cloudEditing || (catalogStatus === 'ready' && Boolean(selectedModel) && bindingReady));
 
     const create = async () => {
+      if (!creatableRuntime(form.runtime)) { setError('请先在插件页启用 Star Harness。'); setStep(0); return; }
       if (!cloudEditing && !bindingReady) { setError(requiresCloudBinding && !memoryInstanceBound ? '启用云记忆前，请在「绑定能力」步骤选择记忆库。' : (missingRequirements.map(item => item.label).join('、') || '启用长期记忆前请选择记忆库')); setStep(1); return; }
       const memoryValidation = validateAgentMemoryConfig({ ...memoryConfig, source: effectiveMemorySource });
       if (!memoryValidation.ok) { setError(memoryValidation.errors.map(item => item.message).join('；')); setStep(2); return; }
@@ -180,7 +200,10 @@ export function createAgentForm({
             ...(!cloudEditing ? { modelProfileId: selectedModel, modelProfileIds: selectedModels.length ? selectedModels : [selectedModel] } : {}),
             ...(boundPolicy ? { policyTemplate: policy, nativeAgentPolicy: boundPolicy } : {}),
             tools: selectedTools.map(resourceId => (originalBindings.tools || []).find(item => item.resourceId === resourceId) || { resourceId }),
-            mcpServers: selectedMcp.map(resourceId => (originalBindings.mcpServers || []).find(item => item.resourceId === resourceId) || { resourceId }),
+            mcpServers: selectedMcp.map(resourceId => {
+              const existing = (originalBindings.mcpServers || []).find(item => bindingId(item) === resourceId);
+              return typeof existing === 'object' ? { ...existing, resourceId } : { resourceId };
+            }),
             skills: selectedSkills.map(resourceId => (originalBindings.skills || []).find(item => item.resourceId === resourceId) || { resourceId }),
             plugins: builtMemory.plugins,
           },
@@ -211,15 +234,23 @@ export function createAgentForm({
         key: value, selected: form.template === value, title, desc: detail, onClick: () => chooseTemplate(value),
       })))) : null;
 
-    const capabilityPicker = (kind, title, values, setValues) => Row({ title: title || '工具', desc: `${values.length} 已选择` },
-      h('span', { className: 'af-selection-summary' }, values.length ? `${values.length} 项` : '未绑定'),
-      Collapsible({ summary: values.length ? '更改' : '绑定', className: 'af-binding-picker' },
-      catalog[kind]?.length ? h('div', { className: 'af-choices' }, catalog[kind].map(resource => {
-        const id = resource.resourceId;
-        return CheckCard({ key: id, checked: values.includes(id), disabled: resource.disabled === true,
-          title: resource.displayName || resource.name || id, desc: resource.unavailableReason || resource.description || resource.version || '',
-          onChange: event => setValues(current => event.target.checked ? [...current, id] : current.filter(value => value !== id)) });
-      })) : h('div', { className: 'af-empty' }, catalogStatus === 'loading' ? '正在读取目录…' : '暂无可用资源')));
+    const capabilityPicker = (kind, title, values, setValues) => {
+      const entries = catalog[kind] || [];
+      const known = new Set(entries.map(resource => resource.resourceId));
+      const unavailable = kind === 'mcp' || kind === 'skill'
+        ? values.filter(id => !known.has(id)).map(id => ({ resourceId: id, unavailableReason: '当前目录未返回此资源，可取消绑定' })) : [];
+      const choices = [...entries, ...unavailable];
+      return Row({ title: title || '工具', desc: `${values.length} 已选择` },
+        h('span', { className: 'af-selection-summary' }, values.length ? `${values.length} 项` : '未绑定'),
+        Collapsible({ summary: values.length ? '更改' : '绑定', className: 'af-binding-picker' },
+          choices.length ? h('div', { className: 'af-choices' }, choices.map(resource => {
+            const id = resource.resourceId;
+            const checked = values.includes(id);
+            return CheckCard({ key: id, checked, disabled: resource.disabled === true && !checked,
+              title: resource.displayName || resource.name || id, desc: resource.unavailableReason || resource.description || resource.version || '',
+              onChange: event => setValues(current => event.target.checked ? [...new Set([...current, id])] : current.filter(value => value !== id)) });
+          })) : h('div', { className: 'af-empty' }, catalogStatus === 'loading' ? '正在读取目录…' : '暂无可用资源')));
+    };
 
     // Native memory configuration. The local-default path (harness, blank/edit)
     // exposes recall/write/rollout; every other enabled path is cloud-only and
@@ -266,7 +297,7 @@ export function createAgentForm({
           const disabled = editing || unavailable;
           const tabRuntime = runtimeOptions.some(option => option.runtimeType === form.runtime && creatableRuntime(option.runtimeType)) ? form.runtime : runtimeOptions.find(option => creatableRuntime(option.runtimeType))?.runtimeType;
           return Button({ key: item.runtimeType, role: 'radio', 'data-runtime': item.runtimeType, 'aria-label': item.displayName || item.runtimeType, 'aria-checked': form.runtime === item.runtimeType, disabled, tabIndex: !disabled && item.runtimeType === tabRuntime ? 0 : -1,
-            className: 'af-runtime-option', title: unavailable ? '该能力暂未开放' : undefined,
+            className: 'af-runtime-option', title: unavailable ? '在插件页安装并启用 Star Harness' : undefined,
             onClick: () => { if (!disabled) update('runtime', item.runtimeType); },
             onKeyDown: event => {
               if (disabled || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
@@ -277,7 +308,7 @@ export function createAgentForm({
               update('runtime', available[next].runtimeType);
               const radios = [...event.currentTarget.parentElement.querySelectorAll('[role="radio"]')].filter(radio => !radio.disabled);
               radios[next]?.focus();
-            } }, h('span', { className: 'af-runtime-name' }, item.displayName || item.runtimeType, unavailable ? h('span', { className: 'af-runtime-tag' }, '未开放') : null), h('small', { title: RUNTIME_DESCRIPTIONS[item.runtimeType] || '由 AgentEngine Server 管理的运行环境。' }, RUNTIME_DESCRIPTIONS[item.runtimeType] || '由 AgentEngine Server 管理的运行环境。'));
+            } }, h('span', { className: 'af-runtime-name' }, item.displayName || item.runtimeType, unavailable ? h('span', { className: 'af-runtime-tag' }, '未安装') : null), h('small', { title: RUNTIME_DESCRIPTIONS[item.runtimeType] || '由 AgentEngine Server 管理的运行环境。' }, RUNTIME_DESCRIPTIONS[item.runtimeType] || '由 AgentEngine Server 管理的运行环境。'));
         }))),
       Field({ label: '用途描述' }, TextArea({ value: form.description, onChange: e => update('description', e.target.value), placeholder: '例如：企业知识库问答与资料检索', rows: 3 })),
       Field({ label: cloudEditing ? '云端系统 Prompt' : '角色与系统 Prompt' }, TextArea({ value: form.prompt, onChange: e => update('prompt', e.target.value), placeholder: '描述 Agent 的身份、边界和回答方式', rows: 6 })),

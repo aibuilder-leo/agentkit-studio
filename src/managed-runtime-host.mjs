@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { loadManagedRuntimeDefinition } from './managed-runtime-definition.mjs';
-import { managedResourceCredentialNames } from './managed-resource-contract.mjs';
+import { managedResourceCredentialNames, validManagedMcpCredential } from './managed-resource-contract.mjs';
 import { managedResourceServerRoot, managedResourcesNeedServer } from './managed-resource-client.mjs';
 import { privateRuntimeDirectory, inspectRuntimeInstallation, prepareRuntimeProfile, runtimeProfileArgs,
   RUNTIME_PROFILE } from './runtime-host-installation.mjs';
@@ -269,15 +269,26 @@ async function adoptDshHome({ root, versions }) {
   } finally { await rm(staging, { recursive: true, force: true }); }
 }
 
-export async function prepareManagedRuntimeHost({ manifest, state, installation, env = process.env }) {
+export async function prepareManagedRuntimeHost({ manifest, state, installation, env = process.env, startHarness }) {
   if (typeof env.AGENTKIT_RUNTIME_TOKEN !== 'string' || env.AGENTKIT_RUNTIME_TOKEN.length < 24) fail('TOKEN_REQUIRED', '运行入口需要独立访问令牌');
   const runtime = await loadManagedRuntimeDefinition({ manifest: resolve(manifest), env });
+  const homePath = resolve(env.AGENTKIT_USER_HOME || '/home/node');
+  const workspacePath = resolve(env.AGENTKIT_WORKSPACE_ROOT || join(homePath, 'workspace'));
+  const remoteHarness = Boolean(runtime.harnessModelSelection);
+  const bundledHarness = !remoteHarness && runtime.declaration.framework === 'harness'
+    && env.AGENTKIT_MANAGED_STAR_HARNESS === '1';
+  const serviceBacked = remoteHarness || bundledHarness;
+  if (bundledHarness && typeof startHarness !== 'function') fail('HARNESS_LAUNCHER_REQUIRED', '托管 Star Harness 缺少服务启动器');
+  if (remoteHarness
+    && workspacePath !== resolve(env.AGENTKIT_ENGINE_SERVICE_WORKSPACE)) {
+    fail('HARNESS_SERVICE_WORKSPACE_MISMATCH', '托管 Harness 服务绑定的工作区与宿主工作区不一致');
+  }
   if (managedResourcesNeedServer(runtime.declaration.resources)) managedResourceServerRoot(env);
   const credentialNames = managedResourceCredentialNames(runtime.declaration.resources);
   for (const name of credentialNames) {
     const value = env[name];
     if (typeof value !== 'string' || !value.trim()) fail('MCP_CREDENTIAL_MISSING', '声明的 MCP 部署凭证未注入');
-    if (value.length > 8192 || !/^[\x20-\x7e]+$/.test(value) || value.includes('****') || value.includes('\u2022\u2022')) fail('MCP_CREDENTIAL_INVALID', '声明的 MCP 部署凭证不可用');
+    if (!validManagedMcpCredential(value)) fail('MCP_CREDENTIAL_INVALID', '声明的 MCP 部署凭证不可用');
   }
   const { modules, entry, dshVersion } = await inspectRuntimeInstallation(installation, 'MANAGED_HOST');
   const directory = path => privateRuntimeDirectory(path, 'MANAGED_HOST');
@@ -298,22 +309,32 @@ export async function prepareManagedRuntimeHost({ manifest, state, installation,
   // Studio's receipt and model config stay version-scoped to keep immutable
   // state, but DSH_HOME is Agent-scoped: sessions, storages and Settings are
   // the Agent's own record, so an accepted update must keep reading them.
-  const userHome = await directory(resolve(env.AGENTKIT_USER_HOME || '/home/node'));
+  const userHome = await directory(homePath);
   const { home: dshHome, settings: dshSettings } = await adoptDshHome({ root, versions });
   // Session ownership is Agent state like DSH_HOME: the Hosted UI must keep
   // listing Sessions recorded by an earlier deployment version.
   const managedSessions = await adoptManagedSessions({ root, versions });
   const codexHome = await directory(join(userHome, '.codex'));
-  const cwd = await directory(resolve(env.AGENTKIT_WORKSPACE_ROOT || join(userHome, 'workspace')));
-  await immutableJson(join(home, 'config.yaml'), { settings: { modelProfiles: runtime.modelProfiles,
-    modelName: runtime.declaration.model, modelProvider: 'openai-compatible', modelBaseUrl: runtime.modelProfiles[0].baseUrl } });
+  const cwd = await directory(workspacePath);
+  if (!serviceBacked) {
+    await immutableJson(join(home, 'config.yaml'), { settings: { modelProfiles: runtime.modelProfiles,
+      modelName: runtime.declaration.model, modelProvider: 'openai-compatible', modelBaseUrl: runtime.modelProfiles[0].baseUrl } });
+  }
   await prepareRuntimeProfile({ dshHome, modules, identity: runtime.identity,
     profileIdentity: { agentId: runtime.identity.agentId }, dshVersion, prefix: 'MANAGED_HOST',
     patchContent: dshSettings ?? undefined });
   const names = ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
     'KSADK_SANDBOX_BACKEND',
-    'AGENTKIT_MODEL_API_KEY', 'OPENAI_BASE_URL', 'AGENTKIT_MANAGED_CODEX_API', 'AGENTKIT_RUNTIME_TOKEN', 'AGENTKIT_RUNTIME_HOST', 'AGENTKIT_RUNTIME_PORT', 'AGENTKIT_RUNTIME_TIMEOUT_MS',
-    ...MANAGED_CODEX_ENV_NAMES,
+    ...(serviceBacked
+      ? ['AGENTKIT_ENGINE_SERVICE_URL', 'AGENTKIT_ENGINE_SERVICE_TOKEN', 'AGENTKIT_ENGINE_SERVICE_WORKSPACE', 'AGENTKIT_ENGINE_SERVICE_CA_FILE']
+      // A managed Host that spawns the bundled engine itself must forward the
+      // launch contract. The image ships the engine but sets no
+      // AGENTKIT_ENGINE_COMMAND default (local and frozen deployments resolve
+      // their own installation), so filtering it here makes every run fail with
+      // NATIVE_ENGINE_UNAVAILABLE.
+      : ['AGENTKIT_MODEL_API_KEY', 'OPENAI_BASE_URL', 'AGENTKIT_MANAGED_CODEX_API', 'AGENTKIT_ENGINE_COMMAND', 'AGENTKIT_ENGINE_ARGS', ...MANAGED_CODEX_ENV_NAMES]),
+    'AGENTKIT_RUNTIME_TOKEN', 'AGENTKIT_RUNTIME_HOST', 'AGENTKIT_RUNTIME_PORT', 'AGENTKIT_RUNTIME_TIMEOUT_MS',
+    'AGENTKIT_MCP_BUSINESS_IDENTITY', 'AGENTKIT_MCP_INVOCATION_IDENTITY', 'AGENTKIT_STRICT_RESOURCES',
     'AGENTENGINE_MANAGED_RUNTIME_NAME', 'AGENTENGINE_MANAGED_RUNTIME_VERSION', 'AGENTENGINE_MANIFEST_PROTOCOL', 'AGENTENGINE_MANIFEST_SHA256',
     'AGENTENGINE_AGENT_ID', 'AGENTENGINE_AGENT_VERSION_ID', 'AGENTENGINE_RESOURCE_SERVER_URL', ...credentialNames,
     ...MANAGED_OBSERVABILITY_ENV_NAMES];
@@ -321,7 +342,17 @@ export async function prepareManagedRuntimeHost({ manifest, state, installation,
   Object.assign(childEnv, { HOME: userHome, DSH_HOME: dshHome, CODEX_HOME: codexHome,
     XDG_CONFIG_HOME: join(userHome, '.config'), XDG_CACHE_HOME: join(userHome, '.cache'), XDG_STATE_HOME: join(userHome, '.local/state'),
     AGENTKIT_HOME: home, AGENTKIT_MANAGED_SESSIONS: managedSessions,
-    OPENAI_MODEL_NAME: runtime.declaration.model, MODEL_PROVIDER: 'openai-compatible',
+    ...(!serviceBacked ? { OPENAI_MODEL_NAME: runtime.declaration.model, MODEL_PROVIDER: 'openai-compatible' } : {}),
     AGENTENGINE_MANIFEST_PATH: resolve(manifest) });
-  return { entry, args: runtimeProfileArgs(), cwd, env: childEnv, identity: { ...runtime.identity, dshVersion } };
+  let companion;
+  if (bundledHarness) {
+    const profile = runtime.modelProfiles[0];
+    companion = await startHarness({ workspaceRoot: cwd, stateDir: join(root, 'star-harness-state'),
+      agentId: runtime.identity.agentId, env,
+      profile: { ...profile, apiKey: env[profile.credentialName] } });
+    Object.assign(childEnv, { AGENTKIT_ENGINE_SERVICE_URL: companion.endpoint,
+      AGENTKIT_ENGINE_SERVICE_TOKEN: companion.token, AGENTKIT_ENGINE_SERVICE_WORKSPACE: cwd,
+      AGENTKIT_ENGINE_SERVICE_MODEL: profile.modelName, AGENTKIT_MANAGED_STAR_HARNESS: '1' });
+  }
+  return { entry, args: runtimeProfileArgs(), cwd, env: childEnv, identity: { ...runtime.identity, dshVersion }, companion };
 }

@@ -101,3 +101,84 @@ test('a saved panel timer and queued subscription stop when their scope closes',
   close(); ready(); changed();
   assert.deepEqual(selected, []);
 });
+
+test('service sessions are created in the engine workspace with their admitted preset and model', async () => {
+  const modelSelection = { provider: 'harness-service', model: 'Harness' };
+  const workspaceRoot = '/workspace/native-agent';
+  const presetId = 'preset-harness-service';
+  const f = bindingFixture(async () => ({ presetId, workspaceRoot, modelSelection, serviceOwnedModel: true }));
+  await f.bind({ agentId: 'agent-a', modelSelection: { provider: 'legacy', model: 'stale-default' } });
+  assert.deepEqual(f.calls, [
+    ['create', { cwd: workspaceRoot, agentPreset: presetId }],
+    ['model', { sessionId: 'blank', ...modelSelection, saveDefault: false }],
+    ['open', 'blank'],
+  ]);
+});
+
+test('new Native conversations inherit the selected project and its model after a switch', async () => {
+  const calls = [], workspace = label => ({ id: label, cwd: '/' + label, retainedBy: { mainView: 1 } });
+  let current = workspace('project-a');
+  const navCtx = {
+    sessions: { list: { getSnapshot: () => ({ byId: { [current.id]: current } }) },
+      create: async options => { calls.push(options); return current.id; } },
+    workspaces: { list: { getSnapshot: () => ({ items: [{ workspaceId: 'workspace-' + current.id, sessionIds: [current.id] }] }) } },
+    uiWorkspace: { openSession() {} },
+  };
+  const hostRemote = { ensureDshPreset: async (_agent, _build, _preset, cwd) => {
+    assert.equal(cwd, current.cwd);
+    return { presetId: 'same-native-preset', workspaceRoot: cwd, serviceOwnedModel: true,
+      modelSelection: { provider: 'independent', model: current.id } };
+  } };
+  const remote = { session: { selectModel: async payload => { calls.push(payload.model); return { ok: true }; } } };
+  const f = createNativeSessionBinding({ navCtx, remote, hostRemote, layout: { selectPanel() {} }, writeConversationAgent() {}, actions: {} });
+  await f.bindAgent({ agentId: 'same-agent', throwOnError: true });
+  current = workspace('project-b');
+  await f.bindAgent({ agentId: 'same-agent', throwOnError: true });
+  assert.deepEqual(calls, [
+    { workspaceId: 'workspace-project-a', agentPreset: 'same-native-preset' }, 'project-a',
+    { workspaceId: 'workspace-project-b', agentPreset: 'same-native-preset' }, 'project-b',
+  ]);
+});
+
+test('a frozen Star Harness build can select a bound workspace from the binding dialog', async () => {
+  const events = [];
+  const navCtx = {
+    sessions: {
+      list: { getSnapshot: () => ({ byId: { old: { id: 'old', cwd: '/unbound', retainedBy: { mainView: 1 } } } }) },
+      create: async payload => { events.push(['create', payload]); return 'new'; },
+    },
+    workspaces: { list: { getSnapshot: () => ({ items: [
+      { path: '/unbound', workspaceId: 'old-workspace', sessionIds: ['old'] },
+      { path: '/beta', workspaceId: 'beta-workspace', sessionIds: [] },
+    ] }) } },
+    uiWorkspace: { openSession: id => events.push(['open', id]) },
+  };
+  let selected = false;
+  const binding = createNativeSessionBinding({
+    navCtx, remote: {}, layout: { selectPanel() {} }, writeConversationAgent() {},
+    hostRemote: {
+      ensureDshPreset: async (agentId, buildId, _preset, cwd) => {
+        events.push(['admit', agentId, buildId, cwd]);
+        if (cwd === '/unbound') throw Object.assign(new Error('workspace unavailable'), { code: 'NATIVE_ENGINE_WORKSPACE_UNAVAILABLE' });
+        return { presetId: 'frozen-beta' };
+      },
+      starHarnessStatus: async () => ({ enabled: true, workspaces: [
+        { workspace: '/alpha', external: true, running: true },
+        { workspace: '/beta', external: false, running: false },
+        { workspace: '/offline', external: true, running: false },
+      ], workspaceChoices: [{ path: '/beta', title: '验收 Beta' }] }),
+    },
+    actions: { confirm: async options => {
+      assert.deepEqual(options.choices, [{ value: '/alpha', label: '/alpha' }, { value: '/beta', label: '验收 Beta · /beta' }]);
+      return selected;
+    } },
+  });
+  await binding.bindAgent({ agentId: 'agent', buildId: 'build-one' });
+  assert.deepEqual(events, [['admit', 'agent', 'build-one', '/unbound']]);
+  selected = '/beta';
+  await binding.bindAgent({ agentId: 'agent', buildId: 'build-one' });
+  assert.deepEqual(events.slice(1), [
+    ['admit', 'agent', 'build-one', '/unbound'], ['admit', 'agent', 'build-one', '/beta'],
+    ['create', { workspaceId: 'beta-workspace', agentPreset: 'frozen-beta' }], ['open', 'new'],
+  ]);
+});

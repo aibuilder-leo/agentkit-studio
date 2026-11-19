@@ -59,6 +59,131 @@ jobs:
           bash ci/install-gitleaks.sh "$RUNNER_TEMP/gitleaks"
           echo "GITLEAKS_BIN=$RUNNER_TEMP/gitleaks/gitleaks" >> "$GITHUB_ENV"
       - run: bash ci/run-public-gate.sh
+  docs-site:
+    name: docs-site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: docs-site/pnpm-lock.yaml
+      - name: Install documentation dependencies
+        working-directory: docs-site
+        run: pnpm install --frozen-lockfile --ignore-workspace
+      # Bilingual parity, navigation order, link integrity, frontmatter, and the
+      # public boundary. Runs here as well as inside `make check` so a docs-only
+      # contributor gets a fast, self-describing failure.
+      - name: Verify bilingual parity and links
+        run: node --test tests/docs-site-i18n.test.mjs
+      # A broken MDX file or YAML frontmatter only surfaces during the build, so
+      # the pull request must compile the site the Pages workflow will publish.
+      - name: Build the documentation site
+        working-directory: docs-site
+        env:
+          NEXT_PUBLIC_BASE_PATH: /agentkit-studio
+        run: pnpm build:static
+      - name: Report the exported site
+        run: |
+          echo "pages: $(find docs-site/out/docs docs-site/out/en -name index.html | wc -l)"
+          du -sh docs-site/out
+
+  native-engine-integration:
+    name: native-engine-integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - run: pnpm install --frozen-lockfile
+      - name: Verify service approvals and acceptance with the locked npm Harness
+        run: node --test tests/native-engine-runtime.test.mjs tests/native-host-approval.test.mjs tests/star-harness-release.test.mjs
+  managed-mcp-identity:
+    name: managed-mcp-business-identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Read and validate repository DSH pin
+        id: dsh-pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/check-dsh-pin.mjs
+          node --input-type=module <<'NODE' >> "$GITHUB_OUTPUT"
+          import { dshPin } from './scripts/dsh-pin.mjs'
+          console.log(`ref=${dshPin.ref}`)
+          console.log(`commit=${dshPin.commit}`)
+          console.log(`patches=${dshPin.patchDirectory}`)
+          NODE
+      - uses: actions/checkout@v4
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: ${{ steps.dsh-pin.outputs.ref }}
+          path: .ci-dsh
+          persist-credentials: false
+      - name: Confirm the DSH checkout is the pinned commit
+        shell: bash
+        run: test "$(git -C .ci-dsh rev-parse HEAD)" = "${{ steps.dsh-pin.outputs.commit }}"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.28.5
+          package_json_file: .ci-dsh/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - run: node scripts/check-node-version.mjs
+      - name: Apply the pinned DSH patch series
+        shell: bash
+        run: |
+          set -euo pipefail
+          for patch in "${{ steps.dsh-pin.outputs.patches }}"/*.patch; do
+            git -C .ci-dsh apply --whitespace=nowarn "$GITHUB_WORKSPACE/$patch"
+          done
+      - name: Build the patched DSH host
+        working-directory: .ci-dsh
+        timeout-minutes: 25
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm run build:official
+      - name: Install Studio dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify the pinned Studio native dependencies
+        run: pnpm build:harness
+      - name: Build the native MCP client required by the Host
+        run: pnpm build:mcp
+      - name: Build the Studio client bundle required by the real Host
+        run: pnpm build:client
+      - name: Move the built DSH out of the Studio workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a .ci-dsh "$RUNNER_TEMP/ci-dsh"
+          rm -rf .ci-dsh
+      - name: Verify the business caller reaches MCP through the real Host
+        run: node scripts/verify-managed-mcp-identity.mjs --report .artifacts/managed-mcp-identity.json
+        env:
+          AGENTKIT_DSH_INSTALLATION: ${{ runner.temp }}/ci-dsh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: managed-mcp-identity-report
+          path: .artifacts/managed-mcp-identity.json
+          if-no-files-found: ignore
   patched-host:
     name: patched-dsh-host
     runs-on: ${{ matrix.os }}
@@ -120,9 +245,24 @@ jobs:
       - name: Build and test the patched DSH host
         timeout-minutes: 15
         run: pnpm exec node scripts/verify-patched-dsh-host.mjs --source .ci-dsh --patches "${{ steps.dsh-pin.outputs.patches }}" --output .artifacts/patched-host --report .artifacts/patched-host-acceptance.json
+      - name: Restore test Chromium cache
+        id: patched-playwright-browsers
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/studio-native-browsers
+          key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
       - name: Install Chromium for the frozen Host proof
         timeout-minutes: 12
-        run: pnpm exec playwright install --with-deps chromium
+        run: |
+          export PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/studio-native-browsers"
+          echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
+          if [[ "${{ steps.patched-playwright-browsers.outputs.cache-hit }}" == "true" ]]; then
+            pnpm exec playwright install-deps chromium
+          else
+            pnpm exec playwright install --with-deps chromium
+          fi
       - name: Install the accepted Studio plugin in an isolated profile
         shell: bash
         run: |
@@ -138,9 +278,15 @@ jobs:
             echo "STUDIO_VERIFY_PROFILE=studio-refactor"
             echo "STUDIO_VERIFY_CHROME=$(node --input-type=module -e 'import { chromium } from "@playwright/test"; console.log(chromium.executablePath())')"
           } >> "$GITHUB_ENV"
+      - name: Verify Codex tool cards with the pinned DSH UI
+        timeout-minutes: 2
+        run: node scripts/verify-dsh-codex-tool-cards.mjs
       - name: Verify the real frozen Host MCP turn
         timeout-minutes: 12
         run: node scripts/verify-studio-frozen-host.mjs .artifacts/frozen-host.json
+      - name: Verify packed Studio switches independent workspace services
+        timeout-minutes: 3
+        run: node scripts/verify-independent-workspace-host.mjs ".artifacts/kingsoftcloud-agentkit-studio-$(node -p "require('./package.json').version").tgz"
       - name: Verify actual Native turn ownership, approvals and process recovery
         timeout-minutes: 8
         shell: bash

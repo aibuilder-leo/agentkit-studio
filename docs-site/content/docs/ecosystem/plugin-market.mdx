@@ -1,0 +1,92 @@
+---
+title: 插件市场
+description: DSH 官方插件索引（format 1）在 Studio 里的接入方式：索引源、请求模型、内置社区索引与安装路径。
+---
+
+插件市场就是 **DSH 官方的插件索引**：一份 `format: 1` 静态 JSON，列出可安装的 bundle 及其标题、图标、作者、版本、`engines.dsh` 兼容范围与安装源。Studio 不再自建聚合——它读取 Host 的 `pluginMarket` 服务，并在 profile 没有任何索引源时，把随包内置的社区索引添加为默认源。
+
+- 内置社区索引：`assets/plugin-market/index.json`，由 Host 在 `GET /api/agentkit.plugin-market/index.json` 提供给官方读取器。
+- 用户索引源：属于当前 profile，可在「发现」页添加、删除、切换。
+- 安装、启用/停用、更新、卸载仍由官方 DSH 插件管理器执行。
+
+<Callout type="info" title="为什么不再自建聚合">
+  旧实现每次冷加载要打 16 个外部请求（npm 搜索 + GitHub 搜索 + 14 份完整 packument），串行叠加最坏 24 秒，还受 GitHub 未授权 10 次/分的限流。索引方案把列表页需要的全部信息放进**一份文档**：一个市场页只需 1 次 GET / 索引源，搜索、筛选、排序与翻页都在 Host 内存里完成。
+</Callout>
+
+## 请求模型
+
+| 操作 | 外部请求数 |
+| --- | --- |
+| 列出索引源（`listIndexes`） | 0（只读配置） |
+| 首次读取某个源 | 1 |
+| 10 分钟 TTL 内再次读取 | 0 |
+| 显式刷新（`refresh: true`） | 1 |
+| 翻第 2 页及以后 | 0（`fetchedAt` 锚定同一份文档） |
+| 搜索 / 筛选 / 排序 | 0（Host 侧内存索引） |
+
+主机参数：`cacheTtlMs` 默认 600000（10 分钟）、`fetchTimeoutMs` 默认 15000、`maxBytes` 默认 128 MiB；单页最多 100 条。索引文档在 Worker 线程里解析，不阻塞 Host 事件循环。
+
+## 索引格式
+
+根字段：`format`（必须为 `1`）、`title`（必填，`LocalizedText`）、`description`、`metadata`、`plugins[]`。插件字段：`name`（npm 包名，索引内唯一）、`title`、`description`、`icon`、`author`、`homepage`、`repository`、`metadata`、`versions[]`。版本字段：`version`（精确 SemVer）、`publishTimestamp`（Unix 秒）、`source`（`{"type":"npm"}` 或 `{"type":"git","url","commit","path"}`）、`engines.dsh`（SemVer range）。
+
+```json
+{
+  "format": 1,
+  "title": { "en": "DSH Community Plugins", "zh": "DSH 社区插件" },
+  "metadata": {
+    "sortKeys": { "downloads": { "title": { "en": "Downloads", "zh": "下载量" }, "order": "desc" } }
+  },
+  "plugins": [
+    {
+      "name": "dshmarket",
+      "title": { "en": "dshmarket", "zh": "dshmarket" },
+      "metadata": { "keywords": ["dsh-plugin"], "sortKeys": { "downloads": 1289262 } },
+      "versions": [
+        { "version": "1.73.20", "publishTimestamp": 1790476800, "source": { "type": "npm" }, "engines": { "dsh": ">=0.2.0" } }
+      ]
+    }
+  ]
+}
+```
+
+未定义的成员会被忽略（可扩展）；格式违规会**整份拒绝**并给出 JSON 路径——没有一个坏条目能悄悄消失。
+
+## 内置社区索引
+
+| 文件 | 作用 |
+| --- | --- |
+| `assets/plugin-market/index.json` | 索引文档（`format: 1`），随包分发，由 Host 提供 |
+| `assets/plugin-market/sources.txt` | 生成输入：每行一个 npm 包名 |
+| `scripts/build-plugin-market-index.mjs` | 生成器 / 校验器 |
+
+```sh
+pnpm build:plugin-index    # 重新生成（读 sources.txt，为空时按下载量取前 80 个包）
+pnpm check:plugin-index    # 不联网，只校验已提交的产物
+```
+
+收录规则：只保留合法 SemVer、有发布时间、未弃用、未私有的版本，每个插件最多 20 个；输出按下载量降序、同分按包名升序，**确定性**（无时间戳、无随机），因此刷新在 review 里只体现为数据变化。
+
+## 安装路径
+
+索引只产出参数，不执行安装：npm 版本解析为 `name@version`（可带 `registry`），Git 版本解析为 `git+<url>.git#<commit>`（子目录追加 `&path:/<dir>`），随后交给官方 `pluginManager.inspect()` / `installBundle()`，兼容性检查、构建脚本批准与失败回滚都在那里。
+
+## 未启用时
+
+官方索引服务只随实验性 bundle `@deepseek-ai/dsh-experimental-plugin-market-bundle`（「自定义插件索引」）挂载。Studio 会在每个 profile 第一次以某个 DSH 版本启动时自动启用它（同一份默认清单还会启用 Computer Use 的 `@deepseek-ai/dsh-cua-bundle`），所以市场默认可用；启用失败或安装不含该 bundle 时，市场返回 `PLUGIN_MARKET_UNAVAILABLE` 并给出一键启用入口。
+
+默认值每个 DSH 版本只应用一次：用户关掉某个默认 bundle 后不会被重新打开，可重试的失败（网络、pnpm）不写标记、下次启动重试；`AGENTKIT_STUDIO_DEFAULT_BUNDLES=0` 可整体关闭这个对齐。
+
+## 安全与信任
+
+索引是第三方内容：标题、作者、标签、来源都由索引声明，DSH 只校验格式、不验证声明。`http:` 索引（含其中列出的安装 spec）可能在传输途中被篡改，不受你控制的网络必须使用 `https:`；URL 图标由浏览器直接请求，会向图片主机暴露你的 IP 地址。安装前请核对确认框中的来源。
+
+## 相关源码
+
+| 关注点 | 位置 |
+| --- | --- |
+| 内置索引源（默认源、文档读取） | `src/plugin-market.mjs` |
+| 内置索引路由 | `src/host/routes/plugin-market-index.mjs` |
+| 默认启用的 bundle | `src/host/default-bundles.mjs` |
+| 安装 / 启停 / 更新 | 官方 `pluginManager`（Studio 不再包一层） |
+| 索引生成器 | `scripts/build-plugin-market-index.mjs` |

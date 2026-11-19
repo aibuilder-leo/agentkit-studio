@@ -12,10 +12,14 @@ import { prepareLocalResourceContext, writeBoundMemory } from '../local-runtime.
 import { studioCodexReasoningWire } from '../model-reasoning.mjs';
 import { readSse } from '../sse.mjs';
 import { CODEX_PROVIDER } from './codex-models.mjs';
+import { NATIVE_ENGINE_EVENT, NATIVE_ENGINE_TEXT, NATIVE_ENGINE_TOOL_DRAFT } from './native-engine-runtime.mjs';
+
+/** Runtimes that run in their own process behind the stream seam. */
 import { dshModelFailure } from '../model-failure.mjs';
-import { createCodexToolRecorder } from './codex-tool-events.mjs';
+import { startDesktopRun } from '../telemetry/host-run.mjs';
+import { createCodexToolRecorder, createResponsesToolRecorder } from './codex-tool-events.mjs';
 import { gatewayHistory, isDshUserInput, isDshAgentNotice } from './dsh-messages.mjs';
-import { assertStudioRuntimeType, assertStudioRunBinding } from '../runtime-contract.mjs';
+import { assertStudioRuntimeType, assertStudioRunBinding, isProcessRuntimeType } from '../runtime-contract.mjs';
 import { resolveRuntimeBridge } from '../host/runtime-bridge.mjs';
 import { createUserQuestionTool } from './user-question-tool.mjs';
 import { hasManagedApprovalRun, hasManagedRun, requestManagedApproval } from '../managed-runtime-approval.mjs';
@@ -34,7 +38,7 @@ export function bindDshAgentRoute(sessionId, binding = {}, owner, scope) {
   const local = binding.local === true;
   const buildId = String(binding.buildId || '').trim();
   const revision = Number(binding.agentRevision);
-  if (local && runtime !== 'codex' && buildId && (!Number.isInteger(revision) || revision < 1)) {
+  if (local && !isProcessRuntimeType(runtime) && buildId && (!Number.isInteger(revision) || revision < 1)) {
     throw Object.assign(new Error('冻结 DSH Build 路由必须绑定正整数 Agent revision'), { code: 'RUN_IDENTITY_INVALID' });
   }
   const route = {
@@ -85,7 +89,7 @@ export function streamDshRuntime(options, { agentId, runtime, local, buildId, ag
   if (!id) throw new Error('AgentKit Studio runtime bridge is unavailable');
   const runtimeType = assertStudioRuntimeType(runtime || 'harness');
   const sessionId = String(options.sessionId || '').trim();
-  const frozenDshBuild = local === true && runtimeType !== 'codex' && Boolean(String(buildId || '').trim());
+  const frozenDshBuild = local === true && !isProcessRuntimeType(runtimeType) && Boolean(String(buildId || '').trim());
   const runId = String(options.runId || options.turnId || options.requestId || (frozenDshBuild ? `run_${randomUUID()}` : '')).trim();
   if (frozenDshBuild) {
     assertStudioRunBinding({ agentId: id, buildId, revision: agentRevision, sessionId, runId }, { agentId: id, sessionId });
@@ -126,6 +130,27 @@ function textOf(message) {
   if (!Array.isArray(content)) return '';
   return content.filter(part => part?.type === 'text' || part?.kind === 'text')
     .map(part => String(part.text || part.value || '')).join('');
+}
+
+function nativeInboxGuidance(agent, messages) {
+  if (!agent?.inbox || !agent.session || typeof agent.session.append !== 'function') return {};
+  const { inbox, session } = agent;
+  const displayed = new Set((messages ?? []).filter(message => message.role === 'user').map(message => message.id));
+  return {
+    nextGuidance() {
+      const message = inbox.nextStep[0];
+      if (message?.source?.kind !== 'user' || typeof message.id !== 'string'
+        || !Array.isArray(message.content) || !message.content.every(part => part.type === 'text')) return null;
+      return { id: message.id, text: textOf(message), message };
+    },
+    commitGuidance({ id, text, message }) {
+      if (!displayed.has(id)) {
+        session.append('user/message', message, { surfaceOp: 'append' });
+        displayed.add(id);
+      }
+      if (inbox.nextStep.some(queued => queued.id === id && textOf(queued) === text)) inbox.remove(id);
+    },
+  };
 }
 
 function isUserInput(message, includeTeamMessages = false) {
@@ -252,14 +277,29 @@ function appendNativeToolCall(state, call) {
   ];
 }
 
-async function* codexFrames(codexRuntime, options, onChunk, toolRecorder) {
+async function* codexFrames(codexRuntime, options, onChunk, toolRecorder, recordEnginePresentation) {
   const state = createChunkState();
   const usage = { inputTokens: 0, outputTokens: 0 };
+  let engineAttempt = null;
   for await (const chunk of codexRuntime.stream(options)) {
     onChunk?.(chunk);
     if (chunk?.type === 'usage') {
       for (const [key, value] of Object.entries(chunk.usage)) usage[key] = (usage[key] || 0) + value;
       yield { type: 'usage', usage: nativeCodexUsage(usage) };
+    }
+    else if (chunk?.type === 'engine-event') {
+      const event = chunk.event;
+      if (engineAttempt && (event.kind === 'effect.settled' && event.category === 'model' || event.kind === 'run.terminal')) {
+        recordEnginePresentation?.({ ...chunk, settledThinkingBlock: state.currentIndex });
+        yield* closeBlock(state, 'reasoning');
+        engineAttempt = null;
+      } else recordEnginePresentation?.(chunk);
+    }
+    else if (chunk?.type === 'engine-tool-draft' || chunk?.type === 'engine-text') recordEnginePresentation?.(chunk);
+    else if (chunk?.type === 'engine-thinking') {
+      if (engineAttempt !== chunk.attemptId) yield* closeBlock(state, 'reasoning');
+      engineAttempt = chunk.attemptId;
+      yield* appendBlock(state, 'reasoning', chunk.text);
     }
     else if (chunk?.type === 'reasoning') yield* appendBlock(state, 'reasoning', chunk.text);
     else if (chunk?.type === 'tool') {
@@ -532,7 +572,7 @@ async function syncCodexTrace(observability, { traceId, sessionId, agentId, agen
 }
 
 /** Create the one provider route mounted by the AgentKit Studio host. */
-export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandler, codexRuntime, resolveCodexModel, codexResourceContext, resourceAdapter, resolveResourceUser, observability, attachments, permissionModeForSession, AdapterBase, bridge } = {}) {
+export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandler, codexRuntime, nativeEngineRuntime, resolveCodexModel, codexResourceContext, resourceAdapter, resolveResourceUser, observability, attachments, permissionModeForSession, requestNativeApproval, AdapterBase, bridge } = {}) {
   const adapter = {
     providerInfo(provider) { return { id: provider, name: 'AgentKit Studio Runtime' }; },
     resolveModel(provider, model) { return Promise.resolve({ provider, id: model, name: model, modalities: ['text'] }); },
@@ -556,7 +596,7 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
       const toolAgent = routed?.agent || options.agent;
       if (mode === 'local' && typeof toolAgent?.session?.id === 'string' && toolAgent.session.id.trim()) bindDshInvocationContext(toolAgent, {
         userId: String(options.userId || options.metadata?.userId || options.user?.id || 'studio-anonymous'),
-        runnerType: runtime === 'codex' ? 'codex' : 'dsh-native',
+        runnerType: isProcessRuntimeType(runtime) ? runtime : 'dsh-native',
       });
       const user = lastUser(options.messages, nativeTools);
       const input = textOf(user).trim();
@@ -567,18 +607,30 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
         ? await resolveResourceUser({ agentId, sessionId: String(options.sessionId || '') })
         : String(options.userId || options.metadata?.userId || options.user?.id || '');
       if (mode === 'local') {
-        const history = await gatewayHistory(options.messages, { attachments, signal: options.signal, includeNotices: nativeTools });
+        // The independent engine owns its previous image-bearing turns. Resolve
+        // only the current attachment receipts for its next Run.
+        const history = await gatewayHistory(runtime === 'native-engine' ? [user] : options.messages,
+          { attachments, signal: options.signal, includeNotices: nativeTools });
         const content = [...history].reverse().find(message => message.role === 'user')?.content || input;
-        if (runtime === 'codex') {
+        if (isProcessRuntimeType(runtime)) {
+          // Both process runtimes share this branch: same workspace, model, resource-context,
+          // approval and trace handling. Only the process behind the stream differs.
+          const processRuntime = runtime === 'codex' ? codexRuntime : nativeEngineRuntime;
           // DSH persists the selected workspace on the official Session header;
           // its Codex subagent uses this same seam. Keep it scoped to this turn.
           const cwd = toolAgent?.session?.header?.cwd;
           if (toolAgent && !cwd) throw Object.assign(new Error('DSH 会话未提供 Codex 工作目录，请重新选择工作区'), { code: 'CODEX_WORKSPACE_UNAVAILABLE' });
           const selection = { provider: options.provider, model: options.studioSelectedModel || options.studioCodexModel || options.model };
-          const selected = options.provider && options.provider !== CODEX_PROVIDER
+          const serviceOwnsModel = runtime === 'native-engine' && (
+            processRuntime?.requiresServiceWorkspace || (processRuntime?.usesServiceFor?.(cwd) ?? processRuntime?.usesService) === true);
+          const selected = serviceOwnsModel ? {} : options.provider && options.provider !== CODEX_PROVIDER
             ? await (typeof resolveCodexModel === 'function' ? resolveCodexModel(selection) : Promise.reject(Object.assign(new Error('此模型提供商未配置 Codex 接口，请在模型设置中检查配置。'), { code: 'CODEX_MODEL_PROVIDER_UNAVAILABLE' })))
             : { model: options.studioCodexModel || (options.provider === CODEX_PROVIDER ? selection.model : undefined) };
-          if (!codexRuntime || typeof codexRuntime.stream !== 'function') {
+          if (runtime === 'native-engine' && !serviceOwnsModel && !selected.modelProvider?.baseUrl)
+            throw Object.assign(new Error('Native 引擎需要一个已配置接口地址的模型，请在 Agent 上绑定网关模型。'), { code: 'NATIVE_ENGINE_MODEL_UNAVAILABLE' });
+          if (runtime === 'native-engine' && (!processRuntime || typeof processRuntime.stream !== 'function'))
+            throw Object.assign(new Error('Native 引擎运行时未注册。'), { code: 'NATIVE_ENGINE_UNAVAILABLE' });
+          if (runtime === 'codex' && (!codexRuntime || typeof codexRuntime.stream !== 'function')) {
             const error = new Error('Codex Provider 未注册；请安装并启用官方 Codex App Server Provider');
             error.code = 'CODEX_PROVIDER_UNAVAILABLE';
             throw error;
@@ -593,6 +645,9 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
               userId,
               toolAdapter,
               agent: toolAgent,
+              runtime,
+              nativeService: serviceOwnsModel,
+              ...(serviceOwnsModel && routed?.runtimeRecord ? { runtimeRecord: routed.runtimeRecord } : {}),
             })
             : {};
           // Durable recall evidence: an empty memory library and a skipped
@@ -609,6 +664,7 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
           }
           const startedAt = new Date().toISOString();
           const traceId = String(options.runId || options.turnId || `run_codex_${Date.now().toString(36)}`);
+          const reportCodexRun = runtime === 'codex' ? startDesktopRun('codex', traceId) : undefined;
           const traceEvents = [{ event_type: 'run.started', at: startedAt, run_id: traceId, session_id: String(options.sessionId || '') }];
           const toolRecorder = createCodexToolRecorder(toolAgent?.session, { recordModelContext: true });
           let responseText = '';
@@ -655,7 +711,8 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
             }
             : baseToolHandler;
           try {
-            yield* codexFrames(codexRuntime, {
+            yield* codexFrames(processRuntime, {
+              turnId: String(options.turnId || options.runId || ''),
               agentId,
               ...(cwd ? { cwd } : {}),
               // The Session's current picker value; the provider validates it.
@@ -668,11 +725,21 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
               sessionId: String(options.sessionId || ''),
               input,
               messages: Array.isArray(options.messages) ? options.messages : [],
-              imageInputs: history.flatMap(message => Array.isArray(message.content) ? message.content.filter(part => part.type === 'image_url').map(part => part.image_url.url) : []),
+              ...(runtime === 'native-engine' ? { inputImages: Array.isArray(content) ? content.filter(part => part.type === 'image_url') : [] }
+                : { imageInputs: history.flatMap(message => Array.isArray(message.content)
+                  ? message.content.filter(part => part.type === 'image_url').map(part => part.image_url.url) : []) }),
+              ...(runtime === 'native-engine' ? nativeInboxGuidance(toolAgent, options.messages) : {}),
               signal: options.signal,
               systemPrompt: resources.systemPrompt || '',
               dynamicTools,
               toolHandler,
+              ...(runtime === 'native-engine' && resources.nativeHostToolHandler
+                ? { nativeHostToolHandler: resources.nativeHostToolHandler } : {}),
+              ...(runtime === 'native-engine' && resources.nativeHostReceiptHandler
+                ? { nativeHostReceiptHandler: resources.nativeHostReceiptHandler } : {}),
+              ...(serviceOwnsModel ? { agentToolPolicy: resources.nativeAgentPolicy,
+                requestPolicyApproval: typeof requestNativeApproval === 'function' && toolAgent
+                  ? info => requestNativeApproval(toolAgent, info) : undefined } : {}),
               ...(managedApproval ? {
                 approvalPolicy: 'on-request',
                 requestApproval: info => requestManagedApproval({
@@ -689,7 +756,23 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
                   sessionId: managedApprovalSessionId,
                 }),
               } : {}),
-            }, recordChunk, toolRecorder);
+            }, recordChunk, toolRecorder, chunk => {
+              // The engine's own view renders these; Studio only keeps them in the Session.
+              try {
+                if (chunk.type === 'engine-text') {
+                  toolAgent?.session?.append?.(NATIVE_ENGINE_TEXT,
+                    { runId: chunk.runId, requestId: chunk.requestId, cursor: chunk.cursor, offset: chunk.offset, delta: chunk.delta }, { ignorable: true });
+                } else if (chunk.type === 'engine-tool-draft') {
+                  toolAgent?.session?.append?.(NATIVE_ENGINE_TOOL_DRAFT,
+                    { runId: chunk.runId, requestId: chunk.requestId, tools: chunk.tools }, { ignorable: true });
+                } else {
+                  toolAgent?.session?.append?.(NATIVE_ENGINE_EVENT, { runId: chunk.runId, view: chunk.view ?? null, event: chunk.event,
+                    ...(Number.isSafeInteger(chunk.settledThinkingBlock) && chunk.settledThinkingBlock >= 0
+                      ? { settledThinkingBlock: chunk.settledThinkingBlock } : {}) }, { ignorable: true });
+                }
+              }
+              catch { /* presentation evidence only */ }
+            });
             if (typeof resources.writeMemory === 'function') {
               try {
                 const result = await resources.writeMemory(responseText);
@@ -698,6 +781,7 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
                 traceEvents.push({ event_type: 'memory.write.failed', at: new Date().toISOString(), run_id: traceId, payload: { code: String(error?.code || 'MEMORY_WRITE_FAILED') } });
               }
             }
+            reportCodexRun?.('completed', { usage: traceEvents.findLast(item => item.event_type === 'model.usage')?.payload.usage });
             await syncCodexTrace(observability, {
               traceId,
               sessionId: String(options.sessionId || ''),
@@ -709,6 +793,7 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
             });
           } catch (error) {
             const canceled = options.signal?.aborted || error?.code === 'CODEX_CANCELED';
+            reportCodexRun?.(canceled ? 'canceled' : 'failed', { error });
             await syncCodexTrace(observability, {
               traceId,
               sessionId: String(options.sessionId || ''),
@@ -761,6 +846,10 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
       if (!cloudClient || typeof cloudClient.streamAction !== 'function') throw new Error('AgentEngine cloud runtime is unavailable');
       const sessionId = String(options.sessionId || '');
       const invocationId = String(options.invocationId || options.runId || '').trim();
+      // When Studio itself calls the deployed RunAgent endpoint, carry the
+      // business caller explicitly. Platform credentials authenticate the
+      // API caller; this field identifies the business subject for MCP.
+      const businessUserId = String(options.businessUserId || options.metadata?.businessUserId || '').trim();
       // ComponentConfig persists a cloud resource reference, but a custom
       // runtime does not automatically expose a knowledge or Skill tool to
       // RunAgent. Materialize bound resources at the Host boundary and send
@@ -810,6 +899,7 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
           ];
         }
       }
+      const toolRecorder = routed?.source === 'agentengine-managed-runtime' ? createResponsesToolRecorder(toolAgent?.session) : null;
       try {
         const upstream = await cloudClient.streamAction('RunAgent', {
           AgentId: agentId,
@@ -818,9 +908,10 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
           Stream: true,
           ApiFormat: 'responses',
           ...(invocationId ? { InvocationId: invocationId } : {}),
+          ...(businessUserId ? { UserId: businessUserId } : {}),
         }, { signal: options.signal });
         let assistantText = '';
-        for await (const frame of cloudFrames(upstream.body, options.signal)) {
+        for await (const frame of cloudFrames(upstream.body, options.signal, { onEvent: toolRecorder?.observe })) {
           if (frame?.type === 'text-delta') assistantText += String(frame.text || '');
           yield frame;
         }
@@ -835,6 +926,8 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
               userId: String(options.userId || options.metadata?.userId || 'studio-anonymous'),
               sessionId,
               agentId,
+              memoryContract: toolAgent?.spec?.memory?.contract,
+              memoryDomain: 'cloud',
             });
           } catch (error) {
             // Memory persistence is a post-response side effect. Preserve the
@@ -856,7 +949,7 @@ export function createDshRuntimeAdapter({ cloudClient, cloudRuntime, localHandle
           }).catch(() => {});
         }
         throw error;
-      }
+      } finally { toolRecorder?.close(); }
     },
   };
   if (bridge) {
