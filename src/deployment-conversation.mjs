@@ -3,12 +3,24 @@ import { CLOUD_PROVIDER } from './deployment-agents.mjs';
 import { clampExecutionMode } from './execution-policy.mjs';
 import { sha256, portableError } from './portable-resources.mjs';
 import { cloudFrames } from './providers/dsh-runtime.mjs';
-import { createCodexToolRecorder } from './providers/codex-tool-events.mjs';
+import { createResponsesToolRecorder } from './providers/codex-tool-events.mjs';
 import { sanitizeResourceCheck } from './resource-checks.mjs';
+import { hostedHarnessView, HOSTED_HARNESS_VIEW_EVENT, HOSTED_HARNESS_VIEW_PATH } from './harness-view-presentation.mjs';
+import { ENGINE_VIEW_CONTRACT, NATIVE_ENGINE_EVENT } from './providers/native-engine-runtime.mjs';
+import { fetchEngineServiceView } from './providers/engine-service-client.mjs';
+
+export function createDeploymentHarnessView({ agents, fetchImpl }) {
+  return async (agentId, sha256) => {
+    if (!/^ar-[A-Za-z0-9-]+$/.test(agentId)) return null;
+    const { endpoint, token, capabilities } = await (await agents()).connect(agentId);
+    if (!capabilities?.includes('harness-task-view')) return null;
+    return fetchEngineServiceView(endpoint, token, sha256, fetchImpl, HOSTED_HARNESS_VIEW_PATH);
+  };
+}
 
 export function createDeploymentConversation({ agents, fetchImpl = fetch, observability, permissionModeFor }) {
   return async function* stream(options) {
-    const { agent, endpoint, token, capabilities, allowedPermissionModes = [], executionModeSwitching } = await (await agents()).connect(options.agentId);
+    const { agent, endpoint, token, capabilities, allowedPermissionModes = [], executionModeSwitching, managedIdentity } = await (await agents()).connect(options.agentId);
     if ((options.cloudVersionId || 'initial') !== (agent.deployment.versionId || 'initial')) {
       throw portableError('DEPLOYMENT_SESSION_VERSION_CHANGED', '云端 Agent 已升级或回滚，请开启新会话使用当前版本；此会话历史仍保留');
     }
@@ -33,8 +45,7 @@ export function createDeploymentConversation({ agents, fetchImpl = fetch, observ
     }
     const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'text/event-stream',
       ...(permissionMode ? { 'x-agentkit-permission-mode': permissionMode } : {}) };
-    const calls = new Map(), items = new Map();
-    const recorder = createCodexToolRecorder(options.session, { label: '云端', code: 'CLOUD' });
+    const ownView = capabilities?.includes('harness-task-view') === true;
     let responseId, verified = false, response, complete = false;
     const startedAt = new Date().toISOString(), events = [], resourceChecks = [];
     const bindings = agent.spec?.bindings || {}, ids = values => (values || []).map(item => typeof item === 'string' ? item : item.resourceId || item.id).filter(Boolean);
@@ -42,12 +53,16 @@ export function createDeploymentConversation({ agents, fetchImpl = fetch, observ
       platform: (bindings.plugins || []).map(item => item.config?.binding?.resource).filter(Boolean).map(item => ({ kind: item.kind, id: item.id || item.resourceId })) };
     let status = 'failed';
     const recordEvent = (event_type, payload) => events.push({ event_type, at: new Date().toISOString(), session_id: options.sessionId, run_id: responseId, payload });
+    const toolRecorder = createResponsesToolRecorder(options.session, recordEvent, { render: !ownView });
     const onEvent = event => {
       const type = event.type || event.event;
       if (['response.created', 'response.in_progress', 'response.completed'].includes(type)) {
         const current = event.response || event, identity = current.metadata?.agentkit;
-        if (identity?.agentId !== agent.deployment.agentId || identity?.buildId !== agent.deployment.buildId
-          || !/^resp_[a-f0-9]{32}_[a-f0-9]{32}_[a-f0-9]{32}$/.test(current.id || '')
+        const identityMatches = managedIdentity
+          ? identity?.agentId === managedIdentity.agentId && identity.versionId === managedIdentity.versionId
+            && identity.manifestSha256 === managedIdentity.manifestSha256
+          : identity?.agentId === agent.deployment.agentId && identity.buildId === agent.deployment.buildId;
+        if (!identityMatches || !/^resp_[a-f0-9]{32}_[a-f0-9]{32}_[a-f0-9]{32}$/.test(current.id || '')
           || (responseId && current.id !== responseId) || (current.model && current.model !== request.model)) {
           throw portableError('DEPLOYMENT_RESPONSE_MISMATCH', '云端响应与当前 Agent 冻结版本不匹配');
         }
@@ -64,6 +79,16 @@ export function createDeploymentConversation({ agents, fetchImpl = fetch, observ
         else if (type === 'response.created') recordEvent('run.started', { cloudAgentId: options.agentId, buildId: agent.deployment.buildId, model: request.model, responseId });
       }
       if (!verified) throw portableError('DEPLOYMENT_RESPONSE_UNVERIFIED', '云端流未返回可核验的 Agent 身份');
+      if (type === HOSTED_HARNESS_VIEW_EVENT) {
+        const frame = event.harness_view;
+        if (ownView && frame?.contract === ENGINE_VIEW_CONTRACT) {
+          const view = hostedHarnessView({ type: NATIVE_ENGINE_EVENT, data: { view: frame.sha256, event: frame.event } });
+          if (view) options.session?.append?.(NATIVE_ENGINE_EVENT, {
+            runId: responseId, view: view.sha256, event: view.event, deploymentAgentId: options.agentId,
+          }, { ignorable: true });
+        }
+        return true;
+      }
       if (type === 'response.resource_check') {
         const check = sanitizeResourceCheck(event.check);
         if (check) {
@@ -71,29 +96,10 @@ export function createDeploymentConversation({ agents, fetchImpl = fetch, observ
         }
         return false;
       }
-      if (type === 'response.output_item.added' && event.item?.type === 'function_call') {
-        const item = event.item;
-        calls.set(item.call_id, item); items.set(item.id, item);
-        recordEvent('tool.started', { callId: item.call_id, name: item.name });
-        recorder?.record({ type: 'tool', id: item.call_id, name: item.name, arguments: item.arguments, phase: 'started' });
-        return Boolean(recorder);
+      if (type === 'response.output_item.done' && event.item?.type !== 'function_call' && event.item?.status === 'incomplete') {
+        throw portableError('CLOUD_STREAM_INCOMPLETE', '云端推理尝试未完成，请检查运行结果');
       }
-      if (type === 'response.function_call_arguments.done') {
-        const item = items.get(event.item_id); if (item) item.arguments = event.arguments;
-        return Boolean(recorder);
-      }
-      if (type === 'response.tool_result') {
-        const item = calls.get(event.call_id);
-        recordEvent(event.is_error ? 'tool.failed' : 'tool.completed', { callId: event.call_id, name: item?.name });
-        if (item) recorder?.record({ type: 'tool', id: item.call_id, name: item.name, arguments: item.arguments,
-          phase: event.is_error ? 'failed' : 'completed', result: { content: event.output } });
-        return Boolean(recorder);
-      }
-      if (type === 'response.output_item.done') {
-        if (event.item?.type === 'function_call') return Boolean(recorder); // Wait for the actual tool result.
-        if (event.item?.status === 'incomplete') throw portableError('CLOUD_STREAM_INCOMPLETE', '云端推理尝试未完成，请检查运行结果');
-      }
-      return false;
+      return toolRecorder.observe(event);
     };
     try {
       response = await fetchImpl(`${endpoint}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request), redirect: 'error', signal: options.signal });
@@ -108,11 +114,12 @@ export function createDeploymentConversation({ agents, fetchImpl = fetch, observ
       if (error?.code) throw error;
       throw portableError('DEPLOYMENT_CONNECTION_FAILED', '云端对话连接失败，请检查网络和运行状态');
     } finally {
-      recorder?.close();
+      toolRecorder.close();
       if (verified) await observability?.syncTrace({ traceId: `cloud_${sha256(JSON.stringify([options.agentId, responseId]))}`, sessionId: options.sessionId,
         agentId: options.agentId, agentName: agent.metadata?.name, executionLocation: 'cloud', status, startedAt,
         completedAt: new Date().toISOString(), events, provenance: { cloudAgentId: options.agentId, agentId: agent.deployment.agentId,
           buildId: agent.deployment.buildId, versionId: agent.deployment.versionId || 'initial', responseId, model: request.model, resourceChecks,
+          ...(managedIdentity ? { runtimeVersionId: managedIdentity.versionId, manifestSha256: managedIdentity.manifestSha256 } : {}),
           revision: agent.metadata?.revision, models: agent.deployment.models || [agent.deployment.model], resourceBindings,
           environment: agent.deployment.environment, region: agent.deployment.region } }).catch(() => {});
       if (!complete) {

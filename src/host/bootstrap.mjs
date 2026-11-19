@@ -1,15 +1,12 @@
+import { createRequire } from 'node:module';
 import { hostFetch } from '../http-fetch.mjs';
 /** Trusted Host startup and scoped dependency composition. Domain services
  * own their stores; route modules own RPC and HTTP transport adapters.
  */
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { NATIVE_MCP_JSON_CODEC } from '../providers/native-mcp-json.mjs';
-import { snapshotNativeMcpSchema, snapshotNativeMcpPlanAccess } from '../providers/native-mcp-schema.mjs';
-import { NATIVE_DSH_TURN_CONTRACT } from '@kingsoftcloud/agentkit-harness-node/native/dsh-turn-contract';
-import { nativeHarnessHostContract, selectedNativeBuildContract } from '../build-engine.mjs';
+import { nativeHarnessHostContract } from '../build-engine.mjs';
 import { loadConfiguredNativeSkills } from '../providers/native-skill-source.mjs';
 import { nativeLocalToolContract } from '../native-tool-catalog.mjs';
 import { registerAuthoringTools } from '../authoring-tools.mjs';
@@ -19,18 +16,23 @@ import { bindPresetRegistry } from '../preset-registry-binding.mjs';
 import { mountRuntimeBridge, ownAsyncResource } from './runtime-bridge.mjs';
 import { createStudioServices } from './services/index.mjs';
 import { alignProfileProductPlugin } from './profile-plugin-alignment.mjs';
+import { applyDefaultBundles } from './default-bundles.mjs';
+import { createPluginMarketIndexSource } from '../plugin-market.mjs';
+import dshPin from '../../dsh-pin.json' with { type: 'json' };
 import { createStudioRoutes } from './routes/index.mjs';
 import { createControlPlaneDispatcher } from './routes/dispatcher.mjs';
 import { registerControlPlaneRoutes } from './routes/http.mjs';
+import { registerPluginMarketIndexRoute } from './routes/plugin-market-index.mjs';
 import { registerBuildDownload } from './routes/download.mjs';
 import { createAgentModelSelection } from './services/model-selection.mjs';
 import { createCloudExecutionModes } from '../cloud-execution-modes.mjs';
 import { loadHostCompatibility } from './compatibility.mjs';
 import { bindFrozenRuntime, FROZEN_RUNTIME_READY } from './frozen-runtime-lifecycle.mjs';
-import { bindNativeBackgroundRuntime } from './native-background-lifecycle.mjs';
 import { createStudioA2aSessionSink } from './services/a2a-session-events.mjs';
 import { boundSkillResources, loadBoundSkillDefinitions } from '../skill-bindings.mjs';
 import { createPromptPredictionHost } from '../prompt-prediction/host.mjs';
+import { createWorkspaceRoutedBuiltins } from '../providers/workspace-routed-builtins.mjs';
+import { requestNativeHostApproval } from '../providers/native-host-approval.mjs';
 
 /**
  * Report the composed Agent preset once the registry resolves it.
@@ -121,7 +123,7 @@ function traceLongAbortDeadlines(thresholdMs = 100_000) {
 }
 
 export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, configurationHome, resourceAdapterFactory,
-  nativeHookRegistrations = [], nativeContextSourceRegistrations = [], githubSkillSourceFetch = hostFetch,
+  githubSkillSourceFetch = hostFetch,
   nativeA2aInbound, nativeManagedKernel } = {}) {
   traceLongAbortDeadlines();
   // The Desktop shell resolves this plugin through the profile, so an upgraded
@@ -147,22 +149,18 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
   const bridge = mountRuntimeBridge(ctx);
   const a2aSessionSink = createStudioA2aSessionSink({ ctx });
   ctx.effect(() => () => a2aSessionSink.close(), 'agentkit-studio: A2A observation delivery');
-  for (const registration of nativeHookRegistrations) {
-    const retire = bridge.nativeHooks.register(registration);
-    ctx.effect(() => retire, 'agentkit-studio: trusted Native hook source');
-  }
-  for (const registration of nativeContextSourceRegistrations) {
-    const retire = bridge.nativeContextSources.register(registration);
-    ctx.effect(() => retire, 'agentkit-studio: trusted Native context source');
-  }
   // Defer optional portable-bundle dependencies until Host activation.
   // The browser uses the separately declared ./client bundle; it must never
   // load this Host bootstrap or its Node-only configuration dependencies.
-  const { loadPortableRuntime, createPortableBundles } = await import('../portable-bundle.mjs');
+  const { loadPortableRuntime, loadPortableRuntimeDirectory, createPortableBundles } = await import('../portable-bundle.mjs');
   const portableRuntime = await loadPortableRuntime(runtimeEnv.AGENTKIT_HOME, runtimeEnv);
   const managedRuntime = runtimeEnv.AGENTENGINE_MANIFEST_PATH
     ? await import('../managed-runtime-definition.mjs').then(({ loadManagedRuntimeDefinition }) => loadManagedRuntimeDefinition({ manifest: runtimeEnv.AGENTENGINE_MANIFEST_PATH, env: runtimeEnv })) : null;
+  const managedBundleRuntime = managedRuntime && runtimeEnv.AGENTKIT_STUDIO_BUNDLE_DIR
+    ? await loadPortableRuntimeDirectory(runtimeEnv.AGENTKIT_STUDIO_BUNDLE_DIR, runtimeEnv)
+    : null;
   if (portableRuntime && managedRuntime) throw Object.assign(new Error('运行输入不能同时包含声明和 portable bundle'), { code: 'MANAGED_HOST_INPUT_CONFLICT' });
+  const resourceBundleRuntime = portableRuntime || managedBundleRuntime;
   const managedResourceContext = managedRuntime
     ? await import('../managed-resource-context.mjs').then(({ createManagedResourceContext }) => createManagedResourceContext(managedRuntime)) : undefined;
   const resolveResourceUser = managedRuntime
@@ -179,11 +177,10 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
       directory: runtimeEnv.AGENTKIT_MANAGED_SESSIONS || join(runtimeEnv.AGENTKIT_HOME, 'managed-sessions'),
     })) : undefined;
   const studioStoreDir = join(runtimeEnv.AGENTKIT_HOME || join(homedir(), '.agentkit'), 'studio');
-  let managedKernel;
   const cloudExecutionModes = createCloudExecutionModes({ directory: studioStoreDir });
   let templateServices, teamTemplates;
   const services = createStudioServices(ctx, {
-    env: runtimeEnv, storeDir: studioStoreDir, portableRuntime, managedRuntime, managedResourceContext, cloudEndpointOptions, configurationHome, resourceAdapterFactory, hostCompatibility,
+    env: runtimeEnv, storeDir: studioStoreDir, portableRuntime: resourceBundleRuntime, managedRuntime, managedResourceContext, cloudEndpointOptions, configurationHome, resourceAdapterFactory, hostCompatibility,
     getTemplateAuthoring: () => templateServices?.templateAuthoring, getAdmission: () => presetAdmission, getModels: () => models, getPortableBundles: () => portableBundles,
   });
   const {
@@ -193,6 +190,52 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
     studioSchedulerPromise, studioObservabilityPromise, studioEvaluationPromise,
     studioChannelsPromise, cloudSchedulesPromise, authoringRemoteFactory, deployments,
   } = services;
+
+  // Default bundles: a desktop profile keeps the official plugin index and
+  // Computer Use switched on. Managed and portable runtimes pin their own
+  // profile bundles, so they are left untouched; everything runs after a short
+  // delay because a first-run install must never delay Host readiness.
+  if (!managedRuntime && !portableRuntime) {
+    const indexSource = createPluginMarketIndexSource({ getService: name => ctx.get(name) });
+    ctx.inject(['pluginManager'], pluginCtx => {
+      // The delay exists so a first-run install never blocks Host readiness. It
+      // must die with the fiber: a profile that unloads Studio inside the delay
+      // (the lifecycle acceptance loads and disposes the plugin in under a
+      // second) would otherwise align bundles after teardown, and enabling one
+      // subscribes `loader/volatile-update` on the still-running Host.
+      let disposed = false;
+      const timer = setTimeout(() => {
+        if (disposed) return;
+        void applyDefaultBundles({
+          manager: pluginCtx.get('pluginManager'), storeDir: studioStoreDir, version: dshPin.version,
+          env: runtimeEnv, log: message => console.log(message),
+          // Never rewrite a profile the person is still onboarding: the first-run
+          // form saves the same package.json and an on-demand install holds its
+          // writer lock. Unreadable configuration counts as configured so a
+          // transient read failure cannot suspend the alignment forever.
+          profileConfigured: () => configurationPromise.then(configuration => configuration.describe())
+            .then(state => state.modelConfigured === true, () => true),
+        }).then(result => {
+          if (!result.applied) return;
+          // With the index bundle enabled the profile still needs a source to
+          // show; the official market has no built-in one, so seed the bundled
+          // community index when the user configured none. Enabling a bundle can
+          // need a restart, in which case the next start seeds it.
+          return indexSource.ensureIndexSource().then(seeded => {
+            if (seeded.seeded) console.log(`[studio] added bundled plugin index source ${seeded.url}`);
+            else if (seeded.reason !== 'already-configured') console.log(`[studio] plugin index source not seeded: ${seeded.reason}`);
+          });
+        }).catch(error => {
+          console.warn('[studio] default bundle alignment skipped', { message: error instanceof Error ? error.message : String(error) });
+        });
+      }, 3000);
+      timer.unref?.();
+      pluginCtx.effect(() => () => {
+        disposed = true;
+        clearTimeout(timer);
+      }, 'agentkit-studio: default bundle alignment');
+    });
+  }
 
   // Generic cloud-control capability for independent DSH plugins. The Host
   // owns configuration, credentials, and AgentEngine clients; consumers only
@@ -223,6 +266,29 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
     : managedRuntime ? await import('../portable-codex.mjs').then(({ isolatedRuntimeCodexOptions }) => isolatedRuntimeCodexOptions({ home: runtimeEnv.AGENTKIT_HOME, scopeId: `manifest_${managedRuntime.sha256}`, env: runtimeEnv })) : {};
   const codexModels = createCodexModelCatalog(codexOptions);
   const codexRuntime = createCodexRuntime(codexOptions);
+  // The Native engine as its own process. Lazy like Codex: hosts without an
+  // engine executable still load and report NATIVE_ENGINE_UNAVAILABLE on use.
+  const { createNativeEngineRuntime, createHarnessServiceModelAdapter, HARNESS_SERVICE_MODEL_PROVIDER } = await import('../providers/native-engine-runtime.mjs');
+  const { engineServiceWorkspaces, canonicalEngineWorkspace } = await import('../providers/engine-service-workspaces.mjs');
+  const externalRoutes = engineServiceWorkspaces(runtimeEnv);
+  const credentials = credentialsService;
+  const models = await import('../model-service.mjs').then(({ createModelService }) => configurationPromise.then(configuration => createModelService({ configuration, credentials })));
+  const starHarness = !managedRuntime && !portableRuntime
+    ? await import('./services/star-harness.mjs').then(async ({ createStarHarnessManager }) => createStarHarnessManager({
+      root: join(studioStoreDir, 'star-harness'), env: runtimeEnv, externalRoutes,
+      packageManager: ctx.get('profileContext')?.packageManager,
+      profile: id => models.profile(id), settings: () => models.settings(),
+      modelProfiles: (await models.settings()).modelProfiles,
+      workspaceRegistry: () => ctx.get('workspaceRegistry'),
+      bundledVersion: createRequire(import.meta.url)('../../package.json').dependencies['@kingsoftcloud/agentkit-harness-node'],
+    })) : undefined;
+  if (starHarness) ctx.effect(() => () => starHarness.close(), 'agentkit-studio: Star Harness workers');
+  const nativeEngineRuntime = createNativeEngineRuntime({ env: runtimeEnv, viewService: nativeManagedKernel?.remote,
+    stateRoot: join(studioStoreDir, 'native-engine'), externalRoutes, starHarness });
+  const resolveHarnessWorkspace = cwd => {
+    const route = nativeEngineRuntime.serviceWorkspace(cwd);
+    return route && { ...route, modelSelection: managedRuntime?.harnessModelSelection ?? route.modelSelection };
+  };
   let localRuntimeHandlerPromise;
   const localRuntimeHandler = async () => {
     if (!localRuntimeHandlerPromise) {
@@ -248,52 +314,57 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
   };
   const { skillDefinitionsForBindings, withBuiltinSkillContextForBindings } = await import('../builtin-skills.mjs');
   const { createCodexResourceContext } = await import('../providers/codex-resource-context.mjs');
-  // Codex App Server turns receive developerInstructions instead of the DSH
-  // skill registry, so the builtin platform guide is inlined there. It is
-  // gated on the same platform bindings as getSkillDefinitions: a Codex Agent
-  // with no platform resource keeps its plain developerInstructions.
-  const resolveCodexBindings = async ({ agentId, buildId, agentRevision } = {}) => {
-    if (!agentId) return {};
-    // Same resolution order as createCodexResourceContext so the gate sees the
-    // exact revision/build bindings the context is built from.
-    const record = buildId ? await (await studioBuildPromise).build.resolve(agentId, buildId)
-      : agentRevision ? await (await agentStorePromise).getRevision(agentId, Number(agentRevision))
-      : await (await agentStorePromise).get(agentId);
-    return record?.spec?.bindings || record?.bindings || {};
-  };
-  const codexResourceContextBase = createCodexResourceContext({ agentStore: agentStorePromise, builds: studioBuildPromise, resources: resourceAdaptersPromise });
-  const codexResourceContext = async request => {
-    const context = await codexResourceContextBase(request);
-    return withBuiltinSkillContextForBindings(context, await resolveCodexBindings(request));
-  };
+  const codexResourceContext = createCodexResourceContext({
+    agentStore: agentStorePromise, builds: studioBuildPromise, resources: resourceAdaptersPromise,
+    augmentContext: withBuiltinSkillContextForBindings,
+  });
   // Materialize resources consumed by DSH adapters before registering those
   // adapters. The Host can service model discovery while this async plugin
   // scope is still activating, so a deployment callback must never observe a
   // temporal-dead-zone binding for the portable bundle service.
-  const credentials = credentialsService;
-  const models = await import('../model-service.mjs').then(({ createModelService }) => configurationPromise.then(configuration => createModelService({ configuration, credentials })));
   const portableBundles = createPortableBundles({ storeDir: studioStoreDir, build: (await studioBuildPromise).build, models,
     adapters: await resourceAdaptersPromise, configuration: await configurationPromise, credentials });
   await registerBuildDownload(ctx, { studioBuildPromise, getPortableBundles: () => portableBundles });
+  const { createDeploymentConversation, createDeploymentHarnessView } = await import('../deployment-conversation.mjs');
+  const deploymentAgents = () => deployments().then(service => service.agents);
+  const { registerNativeEngineView } = await import('./routes/native-engine-view.mjs');
+  registerNativeEngineView(ctx, nativeEngineRuntime, createDeploymentHarnessView({ agents: deploymentAgents, fetchImpl: services.runtimeFetch }));
+  if (!managedRuntime && !portableRuntime) {
+    const { registerNativeWebDelivery } = await import('./routes/native-web-delivery.mjs');
+    ctx.inject(['sessionQuery', 'workspaceFiles'], scope => registerNativeWebDelivery(scope, nativeEngineRuntime));
+  }
   const { CLOUD_PROVIDER, createDeploymentModelAdapter } = await import('../deployment-agents.mjs');
-  const { createDeploymentConversation } = await import('../deployment-conversation.mjs');
   const dshRuntimeAdapter = createDshRuntimeAdapter({
     bridge,
     AdapterBase: LlmAdapter,
     cloudClient: await serverClientPromise,
     attachments: () => ctx.get('attachments'),
-    cloudRuntime: createDeploymentConversation({ agents: async () => (await deployments()).agents, observability: await studioObservabilityPromise, fetchImpl: services.runtimeFetch,
+    cloudRuntime: createDeploymentConversation({ agents: deploymentAgents, observability: await studioObservabilityPromise, fetchImpl: services.runtimeFetch,
       permissionModeFor: agentId => cloudExecutionModes.get(agentId) }),
     localHandler: localRuntimeHandler,
     codexRuntime,
+    nativeEngineRuntime,
     // The permission picker (local, Studio cloud and Hosted UI) converges on the
     // Session preset; read it here so Codex's own sandbox follows the picker.
     permissionModeForSession: session => {
       try {
-        const current = ctx.get?.('permissionPresets')?.current?.(session);
-        if (typeof current === 'string' && current) return current;
-        return ctx.get?.('sessionProjections')?.stateOf?.(session, 'sandboxMode') ?? undefined;
+        // A frozen Container sets headless approval independently of the
+        // sandbox. That combination may have no matching preset name.
+        if (portableRuntime && runtimeEnv.AGENTKIT_BUNDLE_STAR_HARNESS === '1') {
+          return ctx.get?.('sandboxPolicy')?.resolve({ session })?.mode;
+        }
+        const sandbox = ctx.get?.('sandboxPolicy');
+        const override = sandbox?.overrideOf?.(session);
+        if (override) return override;
+        const presets = ctx.get?.('permissionPresets');
+        const current = presets?.current?.(session);
+        if (current && current !== 'custom') return presets.resolve?.(current)?.sandbox ?? sandbox?.defaultMode ?? current;
+        return sandbox?.defaultMode;
       } catch { return undefined; }
+    },
+    requestNativeApproval: (agent, request) => {
+      const approval = agent.ctx?.get?.('approval') ?? ctx.get?.('approval');
+      return requestNativeHostApproval(approval, agent, request);
     },
     resolveCodexModel: selection => resolveConfiguredCodexModel(selection, models),
     codexResourceContext,
@@ -320,6 +391,12 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
     );
     llmCtx.effect(() => llmCtx.llm.registerAdapter([CODEX_PROVIDER], createCodexModelAdapter({ catalog: codexModels, runtime: dshRuntimeAdapter })), 'agentkit-studio: Codex model directory');
     llmCtx.effect(() => llmCtx.llm.registerAdapter([CLOUD_PROVIDER], createDeploymentModelAdapter({ agents: async () => (await deployments()).agents, runtime: dshRuntimeAdapter })), 'agentkit-studio: frozen cloud models');
+    const serviceModels = () => [
+      ...nativeEngineRuntime.serviceModels,
+      ...(managedRuntime?.harnessModelSelection ? [managedRuntime.harnessModelSelection.model] : []),
+    ];
+    llmCtx.effect(() => llmCtx.llm.registerAdapter([HARNESS_SERVICE_MODEL_PROVIDER], createHarnessServiceModelAdapter(LlmAdapter, serviceModels,
+      model => nativeEngineRuntime.serviceModelInfo(model))), 'agentkit-studio: Harness model route');
   });
   // Cordis exposes injected services through `get`; property access is only
   // available on typed service contexts and is absent in the plain plugin
@@ -346,64 +423,65 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
     bindings: config.legacyMemoryBindings, connection: memoryConnection, env: runtimeEnv });
   {
     const { createDshNodeBuiltins } = await import('../providers/dsh-node-builtins.mjs');
-    ctx.effect(() => bridge.setBuiltinToolsFactory(({ ctx: toolsCtx, config, isClosed, signal }) => createDshNodeBuiltins({
-      ctx: toolsCtx, workspaceRoot, stateDir: join(studioStoreDir, 'builtin-workspace'), agentId: config.agentId,
-      isClosed, signal, env: runtimeEnv, fetchImpl: hostFetch,
-      a2aSessionEvents: a2aSessionSink.forPreset(config),
-      browserExecutablePath: runtimeEnv.AGENTKIT_STUDIO_NATIVE_CHROMIUM_EXECUTABLE || undefined,
-      getSkillManagement, getKnowledgeTools, knowledgeBindings: config.knowledgeBindings,
-      getLegacyMemoryTools, legacyMemoryBindings: config.legacyMemoryBindings,
-      toolBindings: config.toolBindings ?? [], toolContracts: config.toolContracts ?? [], componentBindings: config.componentBindings,
-      skillConnection, agentRevision: config.agentRevision, buildId: config.buildId, skillDefinitions: config.skillDefinitions ?? [], a2aBindings: config.a2aBindings ?? [],
-    })), 'agentkit-studio: Node builtin environment');
-  }
-  // A frozen Native Build retains its engine when the live-preset default is
-  // disabled. Register the capability; selection remains explicit per preset.
-  {
-    const { createNativeDshTools } = await import('../providers/native-dsh-tools.mjs');
-    const { bindNativeSessionWorkspace } = await import('../providers/native-session-workspace.mjs');
-    ctx.effect(() => bridge.setNativeToolsFactory(({ ctx: toolsCtx, config, agent }) => {
-      const workspace = bindNativeSessionWorkspace({ ctx: toolsCtx, agent, fallbackRoot: workspaceRoot, managed: Boolean(managedRuntime) });
-      return createNativeDshTools({ ctx: toolsCtx, config, ...workspace,
-        stateDir: join(studioStoreDir, 'native-harness', 'workspace-state', createHash('sha256').update(config.agentId).digest('hex')),
-        browserExecutablePath: runtimeEnv.AGENTKIT_STUDIO_NATIVE_CHROMIUM_EXECUTABLE || undefined,
-        commandEnvironment: runtimeEnv,
+    ctx.effect(() => bridge.setBuiltinToolsFactory(({ ctx: toolsCtx, config, isClosed, signal }) => {
+      const create = root => createDshNodeBuiltins({
+        ctx: toolsCtx, workspaceRoot: root, stateDir: join(studioStoreDir, 'builtin-workspace'), agentId: config.agentId,
+        isClosed, signal, env: runtimeEnv, fetchImpl: hostFetch,
         a2aSessionEvents: a2aSessionSink.forPreset(config),
-        skillConnection,
-        getSkillManagement: id => getSkillManagement(id, workspace.workspaceRoot), getKnowledgeTools,
-        getLegacyMemoryTools: settings => getLegacyMemoryTools(settings, workspace.workspaceRoot),
-        executeMcpTool: request => bridge.executeResourceTool(request),
+        browserExecutablePath: runtimeEnv.AGENTKIT_STUDIO_NATIVE_CHROMIUM_EXECUTABLE || undefined,
+        applicationPreviewOrigin: config.runtime === 'native-engine' ? nativeEngineRuntime.applicationPreview(root)?.origin : undefined,
+        getSkillManagement: id => getSkillManagement(id, root), getKnowledgeTools, knowledgeBindings: config.knowledgeBindings,
+        getLegacyMemoryTools: settings => getLegacyMemoryTools(settings, root), legacyMemoryBindings: config.legacyMemoryBindings,
+        toolBindings: config.toolBindings ?? [], toolContracts: config.toolContracts ?? [], componentBindings: config.componentBindings,
+        skillConnection, agentRevision: config.agentRevision, buildId: config.buildId, skillDefinitions: config.skillDefinitions ?? [], a2aBindings: config.a2aBindings ?? [],
       });
-    }), 'agentkit-studio: Native tool environment');
+      if (config.runtime !== 'native-engine') return create(workspaceRoot);
+      return createWorkspaceRoutedBuiltins({ create, defaultRoot: nativeEngineRuntime.serviceCatalogWorkspace ?? workspaceRoot,
+        resolveHarnessWorkspace: cwd => resolveHarnessWorkspace(cwd)
+          ?? (nativeEngineRuntime.requiresServiceWorkspace ? undefined : { workspaceRoot: canonicalEngineWorkspace(cwd) }),
+        applicationPreviewAvailable: nativeEngineRuntime.applicationPreviewAvailable });
+    }), 'agentkit-studio: Node builtin environment');
   }
-  let nativeHostPromise;
   let dshA2aPromise;
+  let managedHostResources;
   const dshA2aControls = () => dshA2aPromise ||= ownAsyncResource(ctx,
     Promise.all([import('./services/dsh-a2a-control.mjs'), import('@deepseek-ai/dsh-agent')])
-      .then(([{ createStudioDshA2aControls }, { agentEvents }]) => createStudioDshA2aControls({ ctx, agentEvents, signal: bridge.signal })),
+      .then(([{ createStudioDshA2aControls }, { agentEvents }]) => createStudioDshA2aControls({ ctx, agentEvents, signal: bridge.signal,
+        resolveManagedBinding: managedHostResources?.resolveA2aBinding })),
     'agentkit-studio: DSH A2A controls');
-  const nativeHost = () => nativeHostPromise ||= ownAsyncResource(ctx,
-    Promise.all([import('./services/native-harness.mjs'), import('@deepseek-ai/dsh-system-prompt'), agentStorePromise, studioBuildPromise, resourceAdaptersPromise,
-      import('@deepseek-ai/dsh-agent'), studioObservabilityPromise])
-      .then(([{ createStudioNativeHarness }, { renderPrompt }, agents, studio, resources, { emitAgentEvent, agentEvents, assembleContextFor }, observability]) => createStudioNativeHarness({
-        ctx, storeDir: studioStoreDir, workspaceRoot, agents, builds: studio.build, models, resources, fetchImpl: hostFetch, renderPrompt,
-        modelCompatibilityRule: runtimeEnv.KSADK_MODEL_COMPAT_RULE,
-        publishStreamFrame: ({ agent }, frame) => emitAgentEvent(ctx, agent, 'agent/assistant-stream', { frame }),
-        agentEvents, assembleContextFor, hookRegistry: bridge.nativeHooks, contextSourceRegistry: bridge.nativeContextSources, observability,
-      })), 'agentkit-studio: Native Harness lifetime');
-  ctx.effect(() => bridge.setNativeTurnExecutor(async payload => (await nativeHost()).executeTurn(payload)), 'agentkit-studio: Native whole-turn registration');
-  if (nativeManagedKernel !== undefined) {
-    // Materialize the shared Host before its managed borrower so teardown
-    // closes the receiver/Native loops before releasing Host-owned resources.
-    if (nativeManagedKernel.resolveBinding === undefined) await nativeHost();
-    const { registerStudioManagedNativeKernel } = await import('./services/native-managed-kernel.mjs');
-    managedKernel = registerStudioManagedNativeKernel(ctx, { storeDir: studioStoreDir,
-      configuration: nativeManagedKernel, resolveHost: nativeHost });
+  if (nativeManagedKernel?.remote) {
+    const { registerStudioManagedNativeRemote } = await import('./services/native-managed-remote.mjs');
+    const { resources: callback, ...remote } = nativeManagedKernel.remote;
+    registerStudioManagedNativeRemote(ctx, remote);
+    if (callback) {
+      if (callback.token === remote.token) throw Error('Managed Harness credentials must be distinct');
+      const { registerStudioManagedHostResources } = await import('./services/native-managed-host-resources.mjs');
+      const { createStudioManagedSessionDelivery } = await import('./services/native-managed-session-delivery.mjs');
+      const { createDshNodeA2aTools } = await import('../providers/dsh-node-a2a-tools.mjs');
+      const { agentEvents } = await import('@deepseek-ai/dsh-agent');
+      managedHostResources = registerStudioManagedHostResources(ctx, { ...callback, resourceAdapters: resourceAdaptersPromise,
+        sessionDelivery: createStudioManagedSessionDelivery({ ctx, remote }),
+        createA2aPort: config => createDshNodeA2aTools({ ...config, ctx, workspaceRoot,
+          stateDir: join(studioStoreDir, 'builtin-workspace'), env: runtimeEnv, fetchImpl: hostFetch,
+          sessionEvents: a2aSessionSink.forPreset(config) }),
+        async resolveBinding(sessionId) {
+          const found = await ctx.get('sessionController')?.resolveAgent(sessionId);
+          if (found?.error) throw found.error;
+          const agent = found?.agent;
+          if (agent?.session.id !== sessionId) return null;
+          const binding = await agentEvents(ctx, agent).serial('agentkit/harness-resource-binding', {});
+          if (!binding?.agentId || binding.agentId !== callback.scope.agentId) return null;
+          const record = binding.buildId ? await (await studioBuildPromise).build.resolve(binding.agentId, binding.buildId)
+            : await (await agentStorePromise).getRevision(binding.agentId, binding.agentRevision);
+          return { ...binding, record, agent, permissionMode: () => ctx.get('sandboxPolicy')?.resolve({ session: agent.session })?.mode };
+        } });
+    }
+  } else if (nativeManagedKernel !== undefined) {
+    throw Object.assign(new Error('托管 Native Harness 需要独立服务绑定。'), { code: 'NATIVE_ENGINE_UNAVAILABLE' });
   }
   if (nativeA2aInbound !== undefined) {
     const { registerStudioNativeA2aInbound } = await import('./services/native-a2a-inbound.mjs');
-    registerStudioNativeA2aInbound(ctx, { storeDir: studioStoreDir,
-      configuration: { ...nativeA2aInbound, events: nativeA2aInbound.events ?? managedKernel?.events } });
+    registerStudioNativeA2aInbound(ctx, { storeDir: studioStoreDir, configuration: nativeA2aInbound });
   }
   const { describeGlobalModelCredential } = await import('../model-credential-sync.mjs');
   templateServices = await (await import('./services/templates.mjs')).createTemplateServices(ctx, {
@@ -430,8 +508,11 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
     managedAgents: async () => (await serverClientPromise).listAgents({ page: 1, pageSize: 100, remoteOnly: true }),
     getAdmission: () => presetAdmission,
   });
+  const configuredModelSelection = createAgentModelSelection({ models, agentStorePromise, codexModels, selectCodexAgentModel, CLOUD_PROVIDER, dshModelSelection });
   const createPresetAdmission = registry => new DshPresetAdmission({
     registry,
+    resolveHarnessWorkspace,
+    requiresHarnessWorkspace: () => nativeEngineRuntime.requiresServiceWorkspace,
     strictResources,
     nativeEngineContract,
     assertHostCompatible: () => hostCompatibility.require('agent-presets'),
@@ -455,14 +536,14 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
       }
     },
     getActiveModel: async () => (await configurationPromise).resolve(),
-    getModelSelection: createAgentModelSelection({ models, agentStorePromise, codexModels, selectCodexAgentModel, CLOUD_PROVIDER, dshModelSelection }),
+    getModelSelection: agent => managedRuntime?.harnessModelSelection && agent.metadata?.id === managedRuntime.identity.agentId
+      ? managedRuntime.harnessModelSelection : configuredModelSelection(agent),
     getSkillDefinitions: async agent => {
       const bindings = agent?.spec?.bindings || {};
       const bound = boundSkillResources(bindings).length
         ? await loadBoundSkillDefinitions(bindings, await resourceAdaptersPromise) : [];
       const definitions = skillDefinitionsForBindings(bindings, bound);
-      const native = agent?.spec?.runtime?.type === 'harness'
-        && selectedNativeBuildContract(agent, nativeEngineContract) === NATIVE_DSH_TURN_CONTRACT;
+      const native = agent?.metadata?.local === true && agent?.spec?.runtime?.type === 'native-engine';
       return native ? loadConfiguredNativeSkills({ directory: localSkillDirectory, definitions }) : definitions;
     },
     getToolContracts: async agent => {
@@ -474,8 +555,7 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
       }).filter(Boolean).map(String);
       const mcpBindings = Array.isArray(bindings.mcpServers) ? bindings.mcpServers : [];
       if (!bindingRefs.length && !mcpBindings.length) return [];
-      const native = agent?.spec?.runtime?.type === 'harness'
-        && selectedNativeBuildContract(agent, nativeEngineContract) === NATIVE_DSH_TURN_CONTRACT;
+      const native = agent?.metadata?.local === true && agent?.spec?.runtime?.type === 'native-engine';
       const builtinContracts = native ? bindingRefs.map(nativeLocalToolContract).filter(Boolean) : [];
       const localNames = new Set(builtinContracts.map(tool => tool.resourceId));
       const refs = bindingRefs.filter(ref => !localNames.has(ref));
@@ -532,8 +612,6 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
         }
       }
       const mcpContracts = [];
-      const nativeMcp = agent?.spec?.runtime?.type === 'harness'
-        && selectedNativeBuildContract(agent, nativeEngineContract) === NATIVE_DSH_TURN_CONTRACT;
       const seenNames = new Set(builtinContracts.map(contract => String(contract?.name || '')));
       const adapters = mcpBindings.length ? await resourceAdaptersPromise : null;
       for (const binding of mcpBindings) {
@@ -543,8 +621,14 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
           error.code = 'MCP_ID_MISSING';
           throw error;
         }
-        const listed = await adapters.listMcpTools(binding,
-          nativeMcp ? { jsonCodec: NATIVE_MCP_JSON_CODEC, snapshot: true } : undefined);
+        let listed;
+        try { listed = await adapters.listMcpTools(binding); }
+        catch (error) {
+          // A deleted catalog record must not block a desktop session or
+          // hide tools from the other bindings of this revision.
+          if (!strictResources && !portableRuntime && !managedRuntime && error?.code === 'MCP_NOT_FOUND') continue;
+          throw error;
+        }
         for (const tool of listed || []) {
           const name = String(tool?.name || '').trim();
           if (!name) continue;
@@ -560,8 +644,7 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
             mcpResourceId: resourceId,
             name,
             description: String(tool.description || ''),
-            ...(nativeMcp ? { nativeMcpSchema: snapshotNativeMcpSchema(tool), nativeMcpPlanAccess: snapshotNativeMcpPlanAccess(tool) }
-              : { parameters: tool.inputSchema || tool.parameters || { type: 'object', properties: {} } }),
+            parameters: tool.inputSchema || tool.parameters || { type: 'object', properties: {} },
             executor: 'mcp',
             timeoutSeconds: 120,
             sideEffect: 'unknown',
@@ -590,39 +673,41 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
     // The portable profile delays native schedule restoration until frozen
     // preset/model/permission initialization has completed. No timer retry or
     // Session prewarming substitutes for the native dependency lifecycle.
-    readyService: portableRuntime || managedRuntime ? FROZEN_RUNTIME_READY : undefined,
-    start: async runtimeCtx => startFrozenBuildRuntime({ ctx: runtimeCtx, env: runtimeEnv, hostCompatibility, managedRuntime, managedResourceContext, modelService: models, resources: () => resourceAdaptersPromise, build: (await studioBuildPromise).build,
-      admit: (agentId, frozen) => presetAdmission.ensure(agentId, { agent: { ...frozen, metadata: { ...frozen.metadata, local: true } }, allowUnavailableResources: !strictResources, requireModelSelection: true }) }),
+    readyService: resourceBundleRuntime || managedRuntime ? FROZEN_RUNTIME_READY : undefined,
+    start: async runtimeCtx => startFrozenBuildRuntime({ ctx: runtimeCtx, env: runtimeEnv, hostCompatibility, managedRuntime, managedResourceContext, nativeEngineRuntime, modelService: models, resources: () => resourceAdaptersPromise, build: (await studioBuildPromise).build,
+      admit: (agentId, frozen) => presetAdmission.ensure(agentId, { agent: { ...frozen, metadata: { ...frozen.metadata, local: true } }, allowUnavailableResources: !strictResources, requireModelSelection: true, cwd: workspaceRoot }) }),
     onUnavailable: error => console.warn('[agentkit-studio] frozen runtime unavailable:', error.message),
   });
-  if (portableRuntime || managedRuntime) {
+  if (resourceBundleRuntime || managedRuntime) {
     // Settings writes reconcile the Loader. Awaiting them inside plugin apply
     // deadlocks that reconciliation; use the same public startup boundary as DSH Settings.
     let stopped = false;
     ctx.effect(() => () => { stopped = true; }, 'agentkit-studio: portable runtime startup');
     void ctx.root.loader.await().then(async () => {
       if (stopped) return;
-      const { syncPortableModelProfiles } = await import('../portable-model-bridge.mjs');
-      await syncPortableModelProfiles({ settings: ctx.get('settings'), profiles: managedRuntime?.modelProfiles || portableRuntime.manifest.resources.profiles,
-        capabilities: profile => models.capabilitiesOf(profile) });
+      if (!managedRuntime?.harnessModelSelection) {
+        const { syncPortableModelProfiles } = await import('../portable-model-bridge.mjs');
+        await syncPortableModelProfiles({ settings: ctx.get('settings'), profiles: managedRuntime?.modelProfiles || resourceBundleRuntime.manifest.resources.profiles,
+          capabilities: profile => models.capabilitiesOf(profile) });
+      }
       if (stopped) return;
       await bindRuntime();
     }).catch(error => console.error('[agentkit-studio] portable runtime startup failed:', error?.code || 'PORTABLE_STARTUP_FAILED'));
   } else {
     await bindRuntime();
   }
-  bindNativeBackgroundRuntime(ctx, { getHost: nativeHost,
-    readyService: portableRuntime ? FROZEN_RUNTIME_READY : undefined,
-    onError: error => console.error('[agentkit-studio] Native background startup failed:', error?.code || 'NATIVE_BACKGROUND_STARTUP_FAILED'),
-  });
   const routes = createStudioRoutes(ctx, {
     ...services, ...templateServices, studioTeams, teamTemplates, models, syncModelCredential, hostCompatibility, cloudExecutionModes,
     describeGlobalModelCredential: options => describeGlobalModelCredential({ ...options, env: runtimeEnv }),
-    listCodexAgentModels, codexModels, portableBundles, getAdmission: () => presetAdmission, getNativeHost: nativeHost,
-    getDshA2aControls: dshA2aControls,
+    listCodexAgentModels, codexModels, portableBundles, getAdmission: () => presetAdmission,
+    getDshA2aControls: dshA2aControls, starHarness,
   });
   const dispatch = createControlPlaneDispatcher({ bridge, serverClientPromise, routes });
   await registerControlPlaneRoutes(ctx, { ...services, models, dispatch });
+  // The official plugin market reads `format: 1` indexes over http(s); serve
+  // the bundled community index from this Host so the market is usable with
+  // no configuration and no third-party origin.
+  registerPluginMarketIndexRoute(ctx);
   // Prompt prediction is a Studio-owned auxiliary text request. It observes
   // native Session events but never enters the Session loop or mutates history.
   ctx.inject(['connection'], predictionCtx => {
@@ -640,5 +725,4 @@ export async function mountStudioHost(ctx, { env: runtimeEnv = process.env, conf
   // Host mount before its persisted Session presets are registered. Keep the
   // optional-registry catalog profile independent from this native startup.
   if (ctx.get('agentPresets')) await presetRegistryStartup.ready;
-  if (nativeManagedKernel?.autoStart !== false) managedKernel?.startRecovery();
 }

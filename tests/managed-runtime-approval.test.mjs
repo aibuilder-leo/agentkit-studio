@@ -7,6 +7,12 @@ import { createManagedApprovalRegistry, hasManagedApprovalRun, requestManagedApp
 import { createManagedRuntimeActions } from '../src/managed-runtime-actions.mjs';
 import { managedRuntimeBootstrap } from '../src/managed-runtime-capabilities.mjs';
 import { startBuildRuntimeHttp } from '../src/build-runtime-http.mjs';
+import { businessInvocationFor, currentBusinessInvocation } from '../src/providers/business-invocation-context.mjs';
+import { createManagedSessionRegistry } from '../src/managed-session-registry.mjs';
+import { createRuntimeResponsesContract } from '../src/runtime-responses-contract.mjs';
+import { createLocalResourceAdapters } from '../src/local-resource-adapters.mjs';
+import { createMcpLoopbackService } from './fixtures/mcp-loopback-service.mjs';
+import { nativeMcpInvocation } from '../src/providers/native-mcp-invocation.mjs';
 
 const token = 'managed-approval-component-private-token';
 const ownerHeaders = subject => ({ 'x-agentengine-identity-namespace': 'business',
@@ -138,7 +144,8 @@ test('an approval timeout settles the interaction as cancelled', async () => {
   assert.equal(await outcome, 'cancelled');
 });
 
-async function httpFixture(t, { onRun } = {}) {
+async function httpFixture(t, { onRun, mcp = false, env } = {}) {
+  const runtimeConfig = mcp ? { ...runtime, declaration: { ...runtime.declaration, resources: { mcp_servers: [{ id: 'fixture-mcp' }] } } } : runtime;
   const root = await mkdtemp(join(tmpdir(), 'managed-approval-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const stored = new Map(), live = new Map(), listeners = [];
@@ -177,9 +184,9 @@ async function httpFixture(t, { onRun } = {}) {
       { type: 'turn/end', data: { reason: { kind: 'completed' } } }]);
     return { output: 'plain answer' };
   };
-  const actions = await createManagedRuntimeActions({ ctx, runtime, model: 'model', models: ['model'],
-    directory: root, admit: async () => ({ presetId: 'managed-preset' }), approval });
-  const server = await startBuildRuntimeHttp({ agentId: runtime.identity.agentId, managedIdentity: runtime.identity,
+  const actions = await createManagedRuntimeActions({ ctx, runtime: runtimeConfig, model: 'model', models: ['model'],
+    directory: root, admit: async () => ({ presetId: 'managed-preset' }), approval, env: env ?? {} });
+  const server = await startBuildRuntimeHttp({ agentId: runtimeConfig.identity.agentId, managedIdentity: runtimeConfig.identity,
     platformActions: actions, token, runner, approval, model: 'model', port: 0, runLog: () => {},
     validatePrevious: async () => {} });
   t.after(() => { approval.dispose(); return server.close(); });
@@ -187,7 +194,7 @@ async function httpFixture(t, { onRun } = {}) {
   const headers = user => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json',
     'x-agentengine-target-version-id': runtime.identity.versionId,
     'x-agentengine-manifest-sha256': runtime.identity.manifestSha256, ...ownerHeaders(user) });
-  return { server, approval, base, headers, stored,
+  return { server, approval, base, headers, stored, actions, root,
     action: (name, body, user = 'alice') => fetch(`${base}/agentengine/api/v1/${name}`,
       { method: 'POST', headers: headers(user), body: JSON.stringify({ AgentId: 'ar-managed', ...body }) }),
     runAgent: (body, user = 'alice') => fetch(`${base}/agentengine/api/v1/RunAgent`,
@@ -216,6 +223,209 @@ async function readRest(reader, decoder) {
   }
   return text;
 }
+
+test('RunAgent binds business identity and continues on the same platform SessionId', async t => {
+  const seen = [];
+  const api = await httpFixture(t, { onRun: async request => {
+    const identity = currentBusinessInvocation();
+    assert.equal(request.sessionId, identity.nativeSessionId);
+    seen.push(identity);
+  } });
+  const response = await api.runAgent({ SessionId: 'platform-session', BusinessSessionId: 'business-session', UserId: 'customer@example.com',
+    InvocationId: 'business-run-1', ResponsesInput: 'business turn' });
+  assert.equal(response.status, 200);
+  assert.ok((await response.text()).includes('response.completed'));
+  const continued = await api.runAgent({ SessionId: 'platform-session', InvocationId: 'business-run-2', ResponsesInput: 'follow-up' });
+  assert.equal(continued.status, 200);
+  assert.ok((await continued.text()).includes('response.completed'));
+  const [first, second] = seen;
+  assert.equal(first.contract, 'agentkit.business-invocation/v1');
+  assert.equal(first.userId, 'customer@example.com');
+  assert.equal(first.sessionId, 'business-session');
+  assert.equal(first.requestId, 'business-run-1');
+  assert.equal(first.agentId, 'ar-managed');
+  assert.match(first.businessDigest, /^[a-f0-9]{64}$/);
+  assert.match(first.nativeSessionId, /^runtime-/);
+  assert.deepEqual(second, { ...first, requestId: 'business-run-2' });
+  assert.equal(api.stored.size, 1);
+  const transcript = JSON.stringify([...api.stored.values()]);
+  assert.ok(!transcript.includes('customer@example.com') && !transcript.includes('"business-session"'),
+    'business identity must not enter DSH transcript');
+  assert.equal(currentBusinessInvocation(), null, 'request context must not leak after RunAgent returns');
+  const conflict = await api.runAgent({ SessionId: 'platform-session', UserId: 'other@example.com',
+    InvocationId: 'business-run-3', ResponsesInput: 'another turn' });
+  assert.equal(conflict.status, 409);
+  assert.equal((await conflict.json()).ReasonCode, 'RUNTIME_BUSINESS_SESSION_CONFLICT');
+});
+
+test('a failed RunAgent releases the engine Session business binding', async t => {
+  let nativeSessionId;
+  const api = await httpFixture(t, { onRun: async request => {
+    nativeSessionId = request.sessionId;
+    assert.equal(businessInvocationFor(nativeSessionId)?.userId, 'customer@example.com');
+    throw Object.assign(new Error('runner failed'), { code: 'RUNTIME_RUN_FAILED' });
+  } });
+  const response = await api.runAgent({ SessionId: 'failed-business-session', UserId: 'customer@example.com',
+    InvocationId: 'failed-business-run', ResponsesInput: 'fail' });
+  await response.text();
+  assert.equal(businessInvocationFor(nativeSessionId), null);
+});
+
+test('a conflicting business session does not partially bind durable identity', async t => {
+  const api = await httpFixture(t);
+  const responses = createRuntimeResponsesContract({ agentId: runtime.identity.agentId,
+    versionId: runtime.identity.versionId, definitionId: runtime.identity.manifestSha256,
+    token, model: 'model', models: ['model'] });
+  const signal = new AbortController().signal;
+  const headers = api.headers('alice');
+  const base = { input: 'hello', session_id: 'partial-session' };
+  await api.actions.parseResponses({ ...base, request_id: 'partial-first', __agentkit_business_session_id: 'old-session' },
+    headers, responses, signal, { runAgent: true });
+  await assert.rejects(api.actions.parseResponses({ ...base, request_id: 'partial-conflict',
+    __agentkit_business_user_id: 'new-user', __agentkit_business_session_id: 'new-session' },
+  headers, responses, signal, { runAgent: true }), { code: 'RUNTIME_BUSINESS_SESSION_CONFLICT' });
+  const registry = await createManagedSessionRegistry(api.root);
+  const record = await registry.read('partial-session');
+  assert.equal(record.businessUserId, undefined);
+  assert.equal(record.explicitBusinessSessionId, 'old-session');
+});
+
+test('require mode requires a business user but not a BusinessSessionId', async t => {
+  const api = await httpFixture(t, { mcp: true, env: { AGENTKIT_MCP_BUSINESS_IDENTITY: 'require' } });
+  const missing = await api.runAgent({ SessionId: 'mcp-session', ResponsesInput: 'hello' });
+  assert.equal(missing.status, 400);
+  assert.equal((await missing.json()).ReasonCode, 'RUNTIME_BUSINESS_ID_REQUIRED');
+  assert.equal(api.stored.size, 0);
+  const valid = await api.runAgent({ SessionId: 'mcp-session', UserId: 'biz-user', InvocationId: 'mcp-run-1', ResponsesInput: 'hello' });
+  assert.equal(valid.status, 200);
+  await valid.text();
+});
+
+test('without the opt-in, MCP bindings keep accepting callers that never send UserId', async t => {
+  let seen = 'unset';
+  const api = await httpFixture(t, { mcp: true, onRun: async () => { seen = currentBusinessInvocation(); } });
+  const response = await api.runAgent({ SessionId: 'legacy-session', ResponsesInput: 'hello' });
+  assert.equal(response.status, 200);
+  await response.text();
+  // Existing Agents with MCP bindings keep working: the platform correlation ids
+  // still reach MCP, but no business user is invented for a caller that never
+  // claimed one.
+  assert.equal(seen.userId, undefined);
+  assert.equal(seen.sessionId, undefined);
+  assert.equal(typeof seen.requestId, 'string');
+  assert.equal(seen.businessDigest, undefined, 'the platform SessionId alone does not change the replay fingerprint');
+});
+
+test('old platform IDs stored as businessSessionId are ignored and do not block an explicit binding', async t => {
+  const seen = [];
+  const api = await httpFixture(t, { onRun: async () => { seen.push(currentBusinessInvocation()); } });
+  const sessionId = 'platform-session';
+  assert.equal((await api.action('CreateSession', { SessionId: sessionId })).status, 200);
+  const registry = await createManagedSessionRegistry(api.root);
+  const old = await registry.read(sessionId);
+  await registry.write({ ...old, businessSessionId: sessionId });
+  for (const BusinessSessionId of [undefined, 'order-42']) {
+    const response = await api.runAgent({ SessionId: sessionId, BusinessSessionId, ResponsesInput: 'hello' });
+    assert.equal(response.status, 200);
+    assert.ok((await response.text()).includes('response.completed'));
+  }
+  assert.deepEqual(seen.map(item => item.sessionId), [undefined, 'order-42']);
+  assert.deepEqual(seen.map(item => item.nativeSessionId), [old.nativeSessionId, old.nativeSessionId]);
+});
+
+test('RunAgent rejects a BusinessSessionId that is unsafe for MCP headers', async t => {
+  const api = await httpFixture(t);
+  for (const BusinessSessionId of ['unsafe\r\nvalue', 'x'.repeat(201), '   ']) {
+    const response = await api.runAgent({ SessionId: 'platform-session', BusinessSessionId, ResponsesInput: 'hello' });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).ReasonCode, 'RUNTIME_BUSINESS_SESSION_ID_INVALID');
+  }
+  assert.equal(api.stored.size, 0);
+});
+
+test('a direct Responses caller cannot claim a business identity', async t => {
+  let seen = 'unset';
+  const api = await httpFixture(t, { mcp: true, onRun: async () => { seen = currentBusinessInvocation(); } });
+  // The private RunAgent sidecar is Host authority: a direct /v1/responses
+  // caller must not be able to mint one, and its public session_id is not a
+  // business session.
+  const response = await fetch(`${api.base}/v1/responses`, { method: 'POST', headers: api.headers('alice'),
+    body: JSON.stringify({ input: 'hello', session_id: 'platform-session', request_id: 'direct-1',
+      __agentkit_business_user_id: 'forged@example.com', __agentkit_business_session_id: 'forged-session' }) });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(seen.userId, undefined);
+  assert.equal(seen.sessionId, undefined);
+});
+
+test('a RunAgent platform SessionId without BusinessSessionId does not become MCP attribution', async t => {
+  const seen = [];
+  const service = await createMcpLoopbackService({ transport: 'http', getCredential: () => 'loopback-token',
+    onCall: (request, extra) => { seen.push({ meta: request.params._meta, headers: extra?.requestInfo?.headers }); } });
+  const adapters = createLocalResourceAdapters({ credentials: { resolve: async () => ({ value: 'loopback-token' }) } });
+  t.after(async () => { await adapters.close(); await service.close(); });
+  const api = await httpFixture(t, { mcp: true, onRun: async request => {
+    assert.equal(currentBusinessInvocation().userId, 'customer@example.com');
+    assert.equal(currentBusinessInvocation().sessionId, undefined, 'no business session was named');
+    await adapters.callMcpTool({ resourceId: 'fixture-mcp', endpointUrl: service.endpoint,
+      transport: 'http', envRefs: { Authorization: 'env://MCP_LOOPBACK_TOKEN' } }, service.toolName, {},
+    { invocation: nativeMcpInvocation({ scope: { userId: 'aeu_platform' }, agent: { session: { id: request.sessionId } },
+      agentId: 'ar-managed', runId: 'run-1', callId: 'call-1' }) });
+  } });
+  const response = await api.runAgent({ SessionId: 'platform-session', UserId: 'customer@example.com', ResponsesInput: 'hello' });
+  assert.equal(response.status, 200);
+  await response.text();
+  const meta = seen[0].meta['io.agentkit.studio/invocation'];
+  assert.equal(meta.businessUserId, 'customer@example.com');
+  // The platform session is not silently relabelled as the business session.
+  assert.equal(Object.hasOwn(meta, 'businessSessionId'), false);
+  assert.equal(Object.hasOwn(seen[0].headers, 'x-agentkit-business-session-id'), false);
+});
+
+test('omitting RunAgent InvocationId derives a platform request id for the business invocation', async t => {
+  const seen = [];
+  const api = await httpFixture(t, { mcp: true, onRun: async () => { seen.push(currentBusinessInvocation()); } });
+  const response = await api.runAgent({ SessionId: 'no-invocation', UserId: 'customer@example.com', ResponsesInput: 'hello' });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(seen[0].sessionId, undefined);
+  // businessInvocationId is never empty: it carries the platform request id.
+  assert.match(seen[0].requestId, /^[0-9a-f-]{36}$/);
+});
+
+test('a real RunAgent HTTP turn reaches a real MCP server with both identities', async t => {
+  const seen = [];
+  const service = await createMcpLoopbackService({ transport: 'http', getCredential: () => 'loopback-token',
+    onCall: (request, extra) => { seen.push({ meta: request.params._meta, headers: extra?.requestInfo?.headers }); } });
+  const adapters = createLocalResourceAdapters({ credentials: { resolve: async () => ({ value: 'loopback-token' }) } });
+  t.after(async () => { await adapters.close(); await service.close(); });
+  const api = await httpFixture(t, { mcp: true, onRun: async request => {
+    // The Native tool seam composes the identity from the live Session and the
+    // private RunAgent context; the model never supplies either value.
+    assert.equal(currentBusinessInvocation()?.userId, 'customer@example.com');
+    assert.equal(currentBusinessInvocation()?.sessionId, 'business-session-42');
+    await adapters.callMcpTool({ resourceId: 'fixture-mcp', endpointUrl: service.endpoint,
+      transport: 'http', envRefs: { Authorization: 'env://MCP_LOOPBACK_TOKEN' } }, service.toolName, {},
+    { invocation: nativeMcpInvocation({ scope: { tenantId: 'tenant', workspaceId: 'workspace', userId: 'aeu_platform' },
+      agent: { session: { id: request.sessionId } }, agentId: 'ar-managed',
+      runId: 'run-1', callId: 'call-1' }) });
+  } });
+  const response = await api.runAgent({ SessionId: 'platform-session', BusinessSessionId: 'business-session-42', UserId: 'customer@example.com',
+    InvocationId: 'request-1001', ResponsesInput: 'hello' });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(seen.length, 1);
+  const meta = seen[0].meta['io.agentkit.studio/invocation'];
+  // Platform/native identity is preserved; business identity is added beside it.
+  assert.equal(meta.userId, 'aeu_platform');
+  assert.equal(meta.businessUserId, 'customer@example.com');
+  assert.equal(meta.businessSessionId, 'business-session-42');
+  assert.equal(meta.businessInvocationId, 'request-1001');
+  assert.notEqual(meta.sessionId, 'business-session-42', 'native session is not replaced by the business session');
+  assert.equal(seen[0].headers['x-agentkit-business-user-id'], 'customer@example.com');
+  assert.equal(seen[0].headers['x-agentkit-business-session-id'], 'business-session-42');
+  assert.equal(seen[0].headers.authorization, 'Bearer loopback-token', 'MCP credentials stay untouched');
+});
 
 test('managed HTTP presents an approval item and SubmitInteraction approve lets the run finish', async t => {
   const api = await httpFixture(t);

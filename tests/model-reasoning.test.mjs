@@ -1,19 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  REASONING_FALLBACK_PROFILE, REASONING_PROFILES, applyReasoningFallback, isReasoningEffortRejection,
+  REASONING_FALLBACK_PROFILE, REASONING_PROFILES, applyReasoningFallback, dropCarrierlessReasoningTurns,
+  dropOrphanToolReceipts, isReasoningEffortRejection, normalizeEmptyAssistantTurns, normalizeReasoningContent,
   reasoningProfileFor, studioCodexReasoningWire, studioReasoning, studioReasoningFallbackWire, studioReasoningWire,
 } from '../src/model-reasoning.mjs';
 import { createModelBridge } from '../src/client/dsh/model-bridge.mjs';
 import { syncPortableModelProfiles } from '../src/portable-model-bridge.mjs';
 
 test('the capability table is the single source of provider levels and wire values', () => {
-  assert.deepEqual(REASONING_PROFILES.ksyun.levels, ['low', 'high', 'max']);
-  assert.deepEqual(REASONING_PROFILES.ksyun.wire, { low: 'low', high: 'high', max: 'max' });
+  assert.deepEqual(REASONING_PROFILES.ksyun.levels, ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.deepEqual(REASONING_PROFILES.ksyun.wire, { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' });
   assert.equal(REASONING_PROFILES.ksyun.default, 'high');
 
-  assert.deepEqual(REASONING_PROFILES.deepseek.levels, ['low', 'high', 'max']);
-  assert.deepEqual(REASONING_PROFILES.deepseek.wire, { low: 'low', high: 'high', max: 'max' });
+  assert.deepEqual(REASONING_PROFILES.deepseek.levels, ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.deepEqual(REASONING_PROFILES.deepseek.wire, { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' });
   assert.equal(REASONING_PROFILES.deepseek.default, 'high');
 
   assert.deepEqual(REASONING_PROFILES.openai.levels, ['low', 'medium', 'high']);
@@ -31,10 +32,10 @@ test('the capability table is the single source of provider levels and wire valu
 
 test('an enabled profile publishes only the levels its provider accepts', () => {
   assert.deepEqual(studioReasoning({ provider: 'ksyun', reasoningEfforts: true }), {
-    efforts: { low: 'low', high: 'high', max: 'max' }, defaultEffort: 'high',
+    efforts: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' }, defaultEffort: 'high',
   });
   assert.deepEqual(studioReasoning({ provider: 'deepseek', reasoningEfforts: true }), {
-    efforts: { low: 'low', high: 'high', max: 'max' }, defaultEffort: 'high',
+    efforts: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' }, defaultEffort: 'high',
   });
   assert.deepEqual(studioReasoning({ provider: 'openai', reasoningEfforts: true }), {
     efforts: { low: 'low', medium: 'medium', high: 'high' }, defaultEffort: 'medium',
@@ -119,7 +120,8 @@ test('a 400 naming reasoning_effort can be downgraded exactly once', () => {
   assert.equal(applyReasoningFallback({ model: 'gpt' }, 'high'), undefined);
 });
 
-test('the client bridge declares reasoning on the routed model only', async () => {
+/** A fake DSH Settings/credential remote that records every write. */
+function bridgeContext(catalog) {
   const providers = {}, writes = [];
   const ctx = { remote: {
     settings: {
@@ -135,27 +137,114 @@ test('the client bridge declares reasoning on the routed model only', async () =
     },
     credentials: { set: async () => ({ ok: true }) },
   } };
-  const bridge = createModelBridge({ hostRemote: {
-    modelCatalog: async () => ({ items: [
-      { id: 'deepseek-v4.1-flash-1017', name: 'DeepSeek', input: ['text'] },
-      { id: 'seedream-5.0', name: 'Seedream', input: ['text', 'image'] },
-    ] }),
-  } }).createDshModelBridge(ctx, { isActive: () => true });
+  const bridge = createModelBridge({ hostRemote: { modelCatalog: async () => ({ items: catalog }) } })
+    .createDshModelBridge(ctx, { isActive: () => true });
+  return { bridge, providers, writes };
+}
 
-  await bridge.applyProfiles({ profiles: [{
-    id: 'reasoner', provider: 'ksyun', modelName: 'deepseek-v4.1-flash-1017',
-    baseUrl: 'http://kspmas.ksyun.com/v1', credentialName: 'AGENTKIT_MODEL_API_KEY',
-    reasoningEfforts: true, defaultReasoningEffort: 'high',
-  }] });
+const reasoner = {
+  id: 'reasoner', provider: 'ksyun', modelName: 'deepseek-v4.1-flash-1017',
+  baseUrl: 'http://kspmas.ksyun.com/v1', credentialName: 'AGENTKIT_MODEL_API_KEY',
+  reasoningEfforts: true, defaultReasoningEffort: 'high',
+};
+
+test('a gateway catalog route never declares a route default its siblings cannot take', async () => {
+  const { bridge, providers, writes } = bridgeContext([
+    { id: 'deepseek-v4.1-flash-1017', name: 'DeepSeek', input: ['text'] },
+    { id: 'seedream-5.0', name: 'Seedream', input: ['text', 'image'] },
+  ]);
+  await bridge.applyProfiles({ profiles: [reasoner] });
 
   const provider = providers['agentkit-studio-reasoner'];
-  assert.equal(provider.reasoning, 'high');
+  // DSH applies a route default to every model the route serves, and catalog
+  // siblings declare no `reasoningEfforts`. A route default there makes every
+  // turn on a sibling fail with UNSUPPORTED_REASONING_EFFORT before the
+  // request leaves DSH — the `reasoning: max` + `kimi-k3.1-pro-highspeed`
+  // combination this route used to publish.
+  assert.equal(provider.reasoning, undefined);
+  // Kspmas answers `400 Invalid request: role 'developer' is not allowed`, and
+  // pi-ai sends the system prompt as `developer` to every reasoning model on a
+  // route it cannot detect as non-standard.
+  assert.deepEqual(provider.compat, { supportsDeveloperRole: false, supportsStore: false });
   const routed = provider.models.find(model => model.id === 'deepseek-v4.1-flash-1017');
-  assert.deepEqual(routed.reasoningEfforts, { low: 'low', high: 'high', max: 'max' });
+  assert.deepEqual(routed.reasoningEfforts, { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' });
   // The sibling catalog entry must not inherit a capability its profile never
   // declared, or picking it would promise reasoning the gateway cannot do.
   assert.equal(provider.models.find(model => model.id === 'seedream-5.0').reasoningEfforts, undefined);
+  // Default thinking now rides the default selection, which names this very
+  // model, instead of a route default every sibling must also accept.
+  const [, defaultOps] = writes.find(([ns]) => ns === 'agent-default-model');
+  assert.deepEqual(defaultOps.find(op => op.path[0] === 'reasoningEffort'), { op: 'set', path: ['reasoningEffort'], value: 'high' });
   assert.equal(writes.filter(([ns]) => ns === 'llm-pi-ai').length, 1);
+});
+
+test('a Responses route never sets the chat-only store compat', async () => {
+  const { bridge, providers } = bridgeContext([{ id: 'deepseek-v4.1-flash-1017', name: 'DeepSeek', input: ['text'] }]);
+  await bridge.applyProfiles({ profiles: [{ ...reasoner, protocol: 'openai-responses' }] });
+  const provider = providers['agentkit-studio-reasoner'];
+  assert.equal(provider.api, 'openai-responses');
+  // DSH answers `provider "…" sets compat "supportsStore", but no model on the
+  // route speaks a protocol that takes it` — the key belongs to
+  // openai-completions alone. Setting it on a Responses route made every
+  // model mutation fail, which is what a profile declaring
+  // `protocol: openai-responses` hit as soon as it switched wires.
+  assert.deepEqual(provider.compat, { supportsDeveloperRole: false });
+  assert.equal(Object.hasOwn(provider.compat, 'supportsStore'), false);
+});
+
+test('a chat route keeps the store compat', async () => {
+  const { bridge, providers } = bridgeContext([{ id: 'deepseek-v4.1-flash-1017', name: 'DeepSeek', input: ['text'] }]);
+  await bridge.applyProfiles({ profiles: [{ ...reasoner, protocol: 'openai-completions' }] });
+  const provider = providers['agentkit-studio-reasoner'];
+  assert.equal(provider.api, 'openai-completions');
+  // The proxy is stateless, so a gateway that only implements the older
+  // request shape rejects `store` itself and dropping it costs nothing.
+  assert.deepEqual(provider.compat, { supportsDeveloperRole: false, supportsStore: false });
+});
+
+test('a route serving this profile model alone keeps the concrete route default', async () => {
+  const { bridge, providers } = bridgeContext([{ id: 'deepseek-v4.1-flash-1017', name: 'DeepSeek', input: ['text'] }]);
+  await bridge.applyProfiles({ profiles: [reasoner] });
+  const provider = providers['agentkit-studio-reasoner'];
+  assert.equal(provider.reasoning, 'high');
+  assert.deepEqual(provider.compat, { supportsDeveloperRole: false, supportsStore: false });
+  assert.deepEqual(provider.models[0].reasoningEfforts, { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' });
+});
+
+test('a default profile without a reasoning declaration clears a stale default effort', async () => {
+  const { bridge, writes } = bridgeContext([{ id: 'seedream-5.0', name: 'Seedream', input: ['text', 'image'] }]);
+  await bridge.applyProfiles({ profiles: [{
+    id: 'painter', provider: 'ksyun', modelName: 'seedream-5.0',
+    baseUrl: 'http://kspmas.ksyun.com/v1', credentialName: 'AGENTKIT_MODEL_API_KEY',
+  }] });
+  const [, defaultOps] = writes.find(([ns]) => ns === 'agent-default-model');
+  // A level left behind by an earlier profile would fail every fresh session
+  // for an effort this model never declared.
+  assert.deepEqual(defaultOps.find(op => op.path[0] === 'reasoningEffort'), { op: 'unset', path: ['reasoningEffort'] });
+});
+
+test('the DSH route speaks the wire the profile declares', async () => {
+  // The Codex loopback proxy already honours `codexApi`; the DSH provider
+  // hardcoded `openai-completions`, so a profile configured for Responses
+  // still reached its gateway through the Chat conversion — losing reasoning
+  // items and the tool-call semantics for nothing. `protocol` is the more
+  // precise declaration and wins; a profile that declares neither keeps the
+  // historical Chat wire.
+  for (const [patch, expected] of [
+    [{}, 'openai-completions'],
+    [{ codexApi: 'chat-completions' }, 'openai-completions'],
+    // `codexApi` is the Codex selector; it must not flip the DSH route onto a
+    // wire 42 of 星流's 59 models do not implement.
+    [{ codexApi: 'responses' }, 'openai-completions'],
+    [{ protocol: 'openai-chat' }, 'openai-completions'],
+    [{ protocol: 'openai-responses' }, 'openai-responses'],
+    [{ protocol: 'anthropic-messages' }, 'anthropic-messages'],
+    [{ protocol: 'openai-chat', codexApi: 'responses' }, 'openai-completions'],
+  ]) {
+    const { bridge, providers } = bridgeContext([{ id: 'deepseek-v4.1-flash-1017', name: 'DeepSeek', input: ['text'] }]);
+    await bridge.applyProfiles({ profiles: [{ ...reasoner, ...patch }] });
+    assert.equal(providers['agentkit-studio-reasoner'].api, expected, JSON.stringify(patch));
+  }
 });
 
 test('an OpenAI profile routes only OpenAI-legal wire values into DSH', async () => {
@@ -198,11 +287,145 @@ test('the portable bridge publishes the same declaration', async () => {
   }] });
   const value = providers['agentkit-studio-portable'];
   assert.equal(value.reasoning, 'high');
-  assert.deepEqual(value.models[0].reasoningEfforts, { low: 'low', high: 'high', max: 'max' });
+  // Kspmas rejects the `developer` role pi-ai would otherwise send for a
+  // reasoning model, so every Studio route keeps the system role.
+  assert.equal(value.api, 'openai-completions', 'an undeclared profile keeps the Chat wire');
+  assert.deepEqual(value.compat, { supportsDeveloperRole: false, supportsStore: false });
+  assert.deepEqual(value.models[0].reasoningEfforts, { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' });
 
   await syncPortableModelProfiles({ settings, profiles: [{
     id: 'plain', provider: 'ksyun', modelName: 'seedream-5.0',
     baseUrl: 'http://kspmas.ksyun.com/v1', credentialName: 'KEY',
   }] });
   assert.equal(providers['agentkit-studio-plain'].models[0].reasoningEfforts, undefined);
+});
+
+test('empty assistant turns are dropped on both wires, and every other item is preserved', () => {
+  const body = { input: [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+    { type: 'message', role: 'assistant', content: [] },
+    { type: 'message', role: 'assistant', content: '' },
+    { type: 'message', role: 'assistant', content: null },
+    { type: 'message', role: 'assistant' },
+    // A reasoning item is not a turn: its (possibly empty) content is data.
+    { type: 'reasoning', id: 'rs-1', summary: [], content: [] },
+  ] };
+  assert.equal(normalizeEmptyAssistantTurns(body), 4);
+  assert.deepEqual(body.input.map(item => item.type), ['message', 'reasoning']);
+
+  // Chat Completions rows carry their calls inline; a turn with calls is legal
+  // with `content: null` and must survive.
+  const chat = { messages: [
+    { role: 'user', content: 'run' },
+    { role: 'assistant', content: '' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'pwd', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'call_1', content: '/tmp' },
+  ] };
+  assert.equal(normalizeEmptyAssistantTurns(chat), 1);
+  assert.deepEqual(chat.messages.map(message => message.role), ['user', 'assistant', 'tool']);
+  assert.equal(chat.messages[1].tool_calls.length, 1);
+});
+
+test('empty-assistant normalization is lenient about shapes it does not own', () => {
+  assert.equal(normalizeEmptyAssistantTurns(undefined), 0);
+  assert.equal(normalizeEmptyAssistantTurns({}), 0);
+  // `input` may legitimately be a bare string; only arrays are turned and filtered.
+  assert.equal(normalizeEmptyAssistantTurns({ input: 'hi' }), 0);
+  // Non-message assistant items (a Responses reasoning item) keep their content.
+  const reasoningOnly = { input: [{ type: 'reasoning', role: 'assistant', content: null }] };
+  assert.equal(normalizeEmptyAssistantTurns(reasoningOnly), 0);
+  assert.equal(reasoningOnly.input.length, 1);
+});
+
+test('a turn carrying only reasoning is dropped, a turn with a carrier keeps its reasoning', () => {
+  // Trailing reasoning with no text and no call: the gateway refuses the turn.
+  const trailing = { input: [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+    { type: 'reasoning', id: 'rs-1', summary: [], content: null },
+  ] };
+  assert.equal(dropCarrierlessReasoningTurns(trailing), 1);
+  assert.deepEqual(trailing.input.map(item => item.type || item.role), ['message']);
+
+  // Reasoning immediately before a tool call is legal continuity and must stay.
+  const toolTurn = { input: [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'run' }] },
+    { type: 'reasoning', id: 'rs-2', summary: [], content: null, encrypted_content: 'opaque' },
+    { type: 'function_call', call_id: 'call_1', name: 'pwd', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'call_1', output: '/tmp' },
+  ] };
+  assert.equal(dropCarrierlessReasoningTurns(toolTurn), 0);
+  assert.equal(toolTurn.input.length, 4);
+
+  // A content-bearing assistant message is the carrier; `[]` and `''` count as
+  // set on this wire, so those turns keep their reasoning too.
+  const textTurn = { input: [
+    { type: 'reasoning', id: 'rs-3', summary: [], content: [] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'pong' }] },
+  ] };
+  assert.equal(dropCarrierlessReasoningTurns(textTurn), 0);
+
+  // A tool receipt ends the turn, so reasoning after it starts a new one.
+  const afterReceipt = { input: [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'run' }] },
+    { type: 'reasoning', id: 'rs-4', summary: [], content: null },
+    { type: 'function_call', call_id: 'call_1', name: 'pwd', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'call_1', output: '/tmp' },
+    { type: 'reasoning', id: 'rs-5', summary: [], content: null },
+  ] };
+  assert.equal(dropCarrierlessReasoningTurns(afterReceipt), 1);
+  assert.deepEqual(afterReceipt.input.map(item => item.id || item.type), ['message', 'rs-4', 'function_call', 'function_call_output']);
+});
+
+test('carrierless-reasoning normalization is lenient about shapes it does not own', () => {
+  assert.equal(dropCarrierlessReasoningTurns(undefined), 0);
+  assert.equal(dropCarrierlessReasoningTurns({}), 0);
+  assert.equal(dropCarrierlessReasoningTurns({ messages: [{ role: 'assistant', content: '' }] }), 0);
+  const legal = { input: [{ type: 'function_call', call_id: 'c', name: 'n', arguments: '{}' }] };
+  assert.equal(dropCarrierlessReasoningTurns(legal), 0);
+  assert.equal(legal.input.length, 1);
+});
+
+test('a tool receipt keeps only when its call is still in the request', () => {
+  // Responses wire: calls and receipts are separate items paired by call_id.
+  const native = { input: [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'run' }] },
+    { type: 'function_call', call_id: 'call_1', name: 'pwd', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'call_1', output: '/tmp' },
+    { type: 'function_call_output', call_id: 'call_gone', output: '/gone' },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'next' }] },
+  ] };
+  assert.equal(dropOrphanToolReceipts(native), 1);
+  assert.deepEqual(native.input.map(item => item.call_id || item.type), ['message', 'call_1', 'call_1', 'message']);
+
+  // One receipt answers one call: a second receipt for the same id is an orphan.
+  const duplicate = { input: [
+    { type: 'function_call', call_id: 'call_1', name: 'pwd', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'call_1', output: 'first' },
+    { type: 'function_call_output', call_id: 'call_1', output: 'second' },
+  ] };
+  assert.equal(dropOrphanToolReceipts(duplicate), 1);
+  assert.equal(duplicate.input.length, 2);
+  assert.equal(duplicate.input[1].output, 'first');
+
+  // Chat Completions wire: the calls live on the assistant row.
+  const chat = { messages: [
+    { role: 'user', content: 'run' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'pwd', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'call_1', content: '/tmp' },
+    { role: 'tool', tool_call_id: 'call_gone', content: '/gone' },
+    { role: 'user', content: 'next' },
+  ] };
+  assert.equal(dropOrphanToolReceipts(chat), 1);
+  assert.deepEqual(chat.messages.map(message => message.role), ['user', 'assistant', 'tool', 'user']);
+});
+
+test('orphan-receipt normalization is lenient about shapes it does not own', () => {
+  assert.equal(dropOrphanToolReceipts(undefined), 0);
+  assert.equal(dropOrphanToolReceipts({}), 0);
+  assert.equal(dropOrphanToolReceipts({ input: 'hi' }), 0);
+  // A call without its receipt is left for the projection's own pairing check;
+  // this normalization only owns the receipt direction.
+  const callOnly = { input: [{ type: 'function_call', call_id: 'call_1', name: 'pwd', arguments: '{}' }] };
+  assert.equal(dropOrphanToolReceipts(callOnly), 0);
+  assert.equal(callOnly.input.length, 1);
 });

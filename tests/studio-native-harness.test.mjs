@@ -11,12 +11,12 @@ import { memoryDigest, nativeMemoryScopeBindings, nativeUserMemoryCandidate } fr
 import { canonical, MemoryRunStore, NativeKernel, BACKGROUND_COMMAND_CONTRACT, admitBackgroundNotification, backgroundCommandObservation } from '@kingsoftcloud/agentkit-harness-core';
 import { digest, tool } from './fixtures/native-core.mjs';
 import { nativeDshBackgroundOwnership } from '@kingsoftcloud/agentkit-harness-node/native/dsh-background-ownership';
-import { createSessionRoutes } from '../src/host/routes/sessions.mjs';
+import { createSessionRoutes } from './fixtures/retired-session-routes.mjs';
 import { createBackgroundCommandPort } from '@kingsoftcloud/agentkit-harness-node/native/background-command-port';
 import { createAgentStore } from '../src/agent-store.mjs';
 import { createModelService } from '../src/model-service.mjs';
 import { frozenNativeModelDescription } from '../src/providers/native-model-capabilities.mjs';
-import { createStudioNativeHarness } from '../src/host/services/native-harness.mjs';
+import { createStudioNativeHarness } from './fixtures/retired-native-harness.mjs';
 import { createStudioObservability } from '../src/studio-observability.mjs';
 import { createStudioManagedNativeBinding } from '../src/host/services/native-managed-binding.mjs';
 import { STUDIO_MANAGED_NATIVE_INPUT } from '../src/host/services/native-managed-input.mjs';
@@ -194,7 +194,7 @@ test('Native Host uses admitted tool sources for counting/model/recovery and pre
   await f.host.executeTurn(f.payload);
   const head = f.head(), original = f.ledger.load(head.scope, head.runId);
   const expected = [persona, 'ADMITTED_FILE_GUIDANCE', 'Preserve enterprise instructions.'].join('\n\n');
-  assert.equal(original.configuration.hostRecoveryBinding.instructionAssemblyPolicy, 'native-owned-sections/v3');
+  assert.equal(original.configuration.hostRecoveryBinding.instructionAssemblyPolicy, 'engine-instructions/v1');
   assert.equal(original.configuration.hostRecoveryBinding.systemPrompt, expected);
   assert.equal(original.snapshot.messages[0].content, expected);
   const body = JSON.parse(f.requests[0].options.body);

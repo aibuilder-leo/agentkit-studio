@@ -18,7 +18,7 @@
         "testFile": "apps/desktop/tests/main-startup.spec.ts",
         "passed": 114,
         "failed": 0,
-        "evidence": "docs/refactor-patches.md"
+        "evidence": "docs-site/content/docs/contributing/patches.mdx"
       }
     },
     {
@@ -27,7 +27,7 @@
       "equivalence": {
         "replacement": "035",
         "patchedTree": "c2426c392335dde1ca31d5373fefef1940cb01db",
-        "evidence": "docs/product-configuration.md",
+        "evidence": "docs-site/content/docs/reference/configuration.mdx",
         "remaining": "Final cross-platform and installed-update acceptance remains required."
       }
     },
@@ -37,7 +37,7 @@
       "equivalence": {
         "replacement": "035",
         "patchedTree": "c2426c392335dde1ca31d5373fefef1940cb01db",
-        "evidence": "docs/product-configuration.md",
+        "evidence": "docs-site/content/docs/reference/configuration.mdx",
         "remaining": "Final cross-platform and installed-update acceptance remains required."
       }
     },
@@ -47,7 +47,7 @@
       "equivalence": {
         "replacement": "035",
         "patchedTree": "c2426c392335dde1ca31d5373fefef1940cb01db",
-        "evidence": "docs/product-configuration.md",
+        "evidence": "docs-site/content/docs/reference/configuration.mdx",
         "remaining": "Final cross-platform and installed-update acceptance remains required."
       }
     },
@@ -57,7 +57,7 @@
       "equivalence": {
         "replacement": "035",
         "patchedTree": "c2426c392335dde1ca31d5373fefef1940cb01db",
-        "evidence": "docs/product-configuration.md",
+        "evidence": "docs-site/content/docs/reference/configuration.mdx",
         "remaining": "Final cross-platform and installed-update acceptance remains required."
       }
     },
@@ -66,7 +66,7 @@
       "reason": "Consolidated into 017 when porting the current Workspace StartSessionOptions and Agent preset flow. No old DSH runtime compatibility is supported.",
       "equivalence": {
         "replacement": "017",
-        "evidence": "docs/dsh-0.2.1-upgrade.md"
+        "evidence": "docs-site/content/docs/contributing/patches.mdx"
       }
     }
   ],
@@ -2585,12 +2585,163 @@
       },
       "sequence": 52,
       "sha256": "e903a00d71a7019eac161651f77087b2839c371bf99a64016309fe36e64d29b6"
+    },
+    {
+      "id": "084",
+      "file": "084-chat-runtime-presentation.patch",
+      "category": "product",
+      "baseCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+      "dependsOn": [
+        "058"
+      ],
+      "affectedFiles": [
+        "packages/client/ui-chat/src/client/apply.ts",
+        "packages/client/ui-chat/src/client/chat/ChatFlow.tsx",
+        "packages/client/ui-chat/src/client/chat/ChatNodeSeat.tsx",
+        "packages/client/ui-chat/src/client/chat/ChatView.module.css",
+        "packages/client/ui-chat/src/client/chat/ChatView.tsx",
+        "packages/client/ui-chat/src/client/chat/TurnTailNodeView.tsx",
+        "packages/client/ui-chat/src/client/chat/register-node-renderers.ts",
+        "packages/client/ui-chat/src/client/contract/slots.ts",
+        "packages/client/ui-chat/tests/chat-view.client.spec.tsx",
+        "packages/client/ui-sidebar-browser/src/client/view/IframePresentation.ts",
+        "packages/client/ui-sidebar-browser/tests/browser-body.client.spec.tsx"
+      ],
+      "affectedPackages": [
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-sidebar-browser"
+      ],
+      "contracts": [
+        "A session presenter can render the transcript inside the shared Chat viewport. The default flow and shared assistant actions remain available through the same host contract."
+      ],
+      "risk": "medium",
+      "maintainerRole": "Studio UI maintainers",
+      "upstreamStatus": {
+        "state": "not-submitted",
+        "evidence": "Chat view and plugin registration regression tests."
+      },
+      "removeWhen": "The host offers a session-specific chat presenter with access to existing assistant actions.",
+      "verification": {
+        "hostTests": [
+          "packages/client/ui-chat/tests/chat-apply.client.spec.tsx",
+          "packages/client/ui-chat/tests/chat-view.client.spec.tsx",
+          "packages/client/ui-sidebar-browser/tests/browser-body.client.spec.tsx"
+        ],
+        "integrations": [
+          "source",
+          "web"
+        ]
+      },
+      "sequence": 53,
+      "sha256": "6d9f7cc2998589ccfb29fc0a78a43e7796c38a13960ae0f894b0742f0a81f15f"
+    },
+    {
+      "id": "085",
+      "file": "085-native-global-panel-right-sidebar.patch",
+      "baseCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+      "category": "product",
+      "dependsOn": [],
+      "affectedFiles": [
+        "packages/client/ui-sidebar-right/src/client/contract/slots.ts",
+        "packages/client/ui-sidebar-right/src/client/index.ts",
+        "packages/client/ui-sidebar-right/src/client/panel-surfaces.ts",
+        "packages/client/ui-sidebar-right/src/client/service.ts",
+        "packages/client/ui-sidebar-right/src/client/shell/PanelSeat.tsx",
+        "packages/client/ui-sidebar-right/src/client/shell/RightbarRoot.tsx",
+        "packages/client/ui-sidebar-right/src/client/shell/SidebarRight.tsx",
+        "packages/client/ui-sidebar-right/tests/apply.client.spec.ts",
+        "packages/client/ui-sidebar-right/tests/seat.client.spec.tsx"
+      ],
+      "affectedPackages": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ],
+      "contracts": [
+        "A global main panel may register native right-sidebar tabs without creating or borrowing a Session. The frame still owns the divider and the retained column width."
+      ],
+      "risk": "medium",
+      "maintainerRole": "Studio UI maintainers",
+      "upstreamStatus": {
+        "state": "not-submitted",
+        "evidence": "Root panel and Session sidebar switching, native tab strip, fullscreen, collapse and provider disposal regression checks."
+      },
+      "removeWhen": "DSH provides a supported native right sidebar for global main panels.",
+      "verification": {
+        "hostTests": [
+          "packages/client/ui-sidebar-right/tests/apply.client.spec.ts",
+          "packages/client/ui-sidebar-right/tests/seat.client.spec.tsx"
+        ],
+        "integrations": [
+          "source",
+          "web",
+          "electron"
+        ]
+      },
+      "sequence": 54,
+      "sha256": "7380ea061ed964fe8a450749a9f22f7a4f09439834940c46bd2d8cad11bef58e"
+    },
+    {
+      "id": "086",
+      "file": "086-studio-desktop-telemetry.patch",
+      "category": "product",
+      "risk": "high",
+      "baseCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+      "maintainerRole": "Studio desktop maintainers",
+      "removeWhen": "Studio packaging and the upstream Host provide an equivalent first-party telemetry lifecycle and tested privacy gates.",
+      "contracts": [
+        "Studio Desktop disables inherited DSH product and session exporters after all profile overlays.",
+        "Studio telemetry is loaded only from the packaged product resource or a development fixture.",
+        "Only the Desktop main process allows collection after notice, persists the outbox and sends to its configured receiver.",
+        "Host Run messages and sender-bound settings operations do not expose a telemetry uploader to Web or renderer code."
+      ],
+      "affectedPackages": [
+        "apps/desktop",
+        "packages/boot/app-boot"
+      ],
+      "affectedFiles": [
+        "apps/desktop/electron-builder.config.d.mts",
+        "apps/desktop/scripts/electron-builder-config.mjs",
+        "apps/desktop/src/host-process.ts",
+        "apps/desktop/src/ipc.ts",
+        "apps/desktop/src/main.ts",
+        "apps/desktop/src/preload-app.ts",
+        "apps/desktop/src/studio-telemetry.ts",
+        "packages/boot/app-boot/src/profile-context.ts",
+        "packages/boot/app-boot/tests/profile.spec.ts"
+      ],
+      "dependsOn": [
+        "030",
+        "033",
+        "039",
+        "064",
+        "082",
+        "083"
+      ],
+      "upstreamStatus": {
+        "state": "not-submitted",
+        "evidence": "Studio-specific collection policy and packaging resource."
+      },
+      "verification": {
+        "hostTests": [
+          "apps/desktop/tests/preload-app.spec.ts",
+          "apps/desktop/tests/product-branding.spec.ts",
+          "packages/boot/app-boot/tests/profile.spec.ts"
+        ],
+        "integrations": [
+          "source",
+          "electron",
+          "product-profiles",
+          "macos",
+          "windows"
+        ]
+      },
+      "sequence": 55,
+      "sha256": "e8189763edffe809455b036a3201c597a140d7deb7545de2c64e4455b47a09e6"
     }
   ],
-  "patchedTree": "528711c889fd7041f3caf55c9c114bdf7e5de89d",
-  "patchedSourceSha256": "5ed309d1cff802a585331425bbd2c2ad8ee2011de149ee0416347c89245ae43b",
+  "patchedTree": "8a42dfaba954450c981fca37b2fc77b2b20ffd60",
+  "patchedSourceSha256": "a900a482a02f3b7087695e33d7fb3c7c236b9b1c59674f11778806decdfaca25",
   "maintenanceSource": {
     "descriptor": "source.json",
-    "sha256": "162f9bed2d85110d7358575efb07221cdcd346715b0e208b165593204669dbab"
+    "sha256": "33efe43b8d4437557dcb4e9b882c583cdde9d7d233495b1e5a9d56c702b5c53c"
   }
 }

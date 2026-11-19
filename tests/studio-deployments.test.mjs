@@ -1,25 +1,52 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createStudioBuild } from '../src/studio-build.mjs';
-import { createPortableBundles } from '../src/portable-bundle.mjs';
+import { createPortableBundles, verifyPortableBundle } from '../src/portable-bundle.mjs';
 import { createOperationManager } from '../src/studio-operations.mjs';
 import { createStudioDeployments } from '../src/studio-deployments.mjs';
 import { createDeploymentStore } from '../src/deployment-store.mjs';
 import { resolveDeploymentCredentials } from '../src/deployment-credentials.mjs';
+import { createDeploymentConversation } from '../src/deployment-conversation.mjs';
+import { CLOUD_PROVIDER } from '../src/deployment-agents.mjs';
+import { sha256 } from '../src/portable-resources.mjs';
+import { createRuntimeResponsesContract } from '../src/runtime-responses-contract.mjs';
+import { createRuntimeResponsesStream } from '../src/runtime-responses-stream.mjs';
 import { modelCredentialName } from '../src/client/dsh/model-bridge.mjs';
+import { createLocalMcpStore } from '../src/local-mcp-store.mjs';
+import { createLocalResourceAdapters } from '../src/local-resource-adapters.mjs';
+import { createSkillDiscovery } from '../src/skill-discovery.mjs';
+import { parseManagedRuntimeManifest } from '../src/managed-runtime-manifest.mjs';
+import { managedResourceBindings } from '../src/managed-resource-contract.mjs';
+import { createMcpLoopbackService } from './fixtures/mcp-loopback-service.mjs';
 
-async function fixture(t, { runtime = 'harness', credentialName = 'MODEL_KEY', createError, responseLost = false, health = true, gatewayHealth = false, authReady = true, initialStatus = 'RUNNING', uploadDelayMs = 0 } = {}) {
+async function fixture(t, { runtime = 'harness', deploymentType = 'Container', credentialName = 'MODEL_KEY', bindings: bindingOverrides = {}, createError, responseLost = false, health = true, gatewayHealth = false, authReady = true, initialStatus = 'RUNNING', uploadDelayMs = 0, customMcp } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'studio-deploy-')); t.after(() => rm(root, { force: true, recursive: true }));
   const agentId = 'ar-local-1234567890abcdef', cloudAgentId = 'ar-cloud-test';
-  const values = { cloudServerUrl: 'https://aicp.api.ksyun.com', cloudRegion: 'pre-online', cloudAccessKey: 'test-ak', cloudSecretKey: 'test-sk', cloudBucket: 'private-test' };
+  const values = { cloudServerUrl: 'https://aicp.api.ksyun.com', cloudRegion: 'pre-online', cloudAccessKey: 'test-ak', cloudSecretKey: 'test-sk', cloudBucket: deploymentType === 'ManagedRuntime' ? '' : 'private-test' };
   const configuration = { resolve: async () => ({ values }) };
   const profile = { id: 'model', provider: 'ksyun', modelName: 'bound-model', baseUrl: 'https://model.example/v1', credentialName, apiKey: 'model-private' };
   const mcp = { resourceId: 'search', endpoint: 'https://search.example/mcp', apiKey: 'search-private' };
-  const models = { profile: async () => profile }, adapters = { describeMcp: async () => mcp };
-  const build = createStudioBuild({ storeDir: root }), bindings = { modelProfileId: 'model', mcpServers: ['search'] };
+  const models = { profile: async () => profile };
+  const build = createStudioBuild({ storeDir: root }), bindings = { modelProfileId: 'model', mcpServers: ['search'], ...bindingOverrides };
+  let adapters = { describeMcp: async () => mcp }, credentials;
+  if (customMcp) {
+    const resourceStore = createLocalMcpStore({ storeDir: join(root, 'mcps') });
+    const record = await resourceStore.create({ server: { name: 'custom-header-mcp', endpointUrl: customMcp.endpoint,
+      envRefs: { 'X-Service-Token': 'env://team/services.mcp' } } });
+    const skillDiscovery = createSkillDiscovery({ storeDir: join(root, 'skills') }), skillSource = join(root, 'source');
+    await mkdir(skillSource);
+    await writeFile(join(skillSource, 'SKILL.md'), '---\nname: demo-skill\ndescription: Deployment fixture\n---\nDemo\n');
+    const scan = await skillDiscovery.discover([skillSource]);
+    const skill = await skillDiscovery.commitDiscovered(scan.inspectionToken, scan.candidates[0].candidateId);
+    bindings.mcpServers = [record.resourceId];
+    bindings.skills = [skill.resourceId];
+    credentials = { resolve: async name => name === 'team/services.mcp' ? { value: customMcp.value } : null };
+    adapters = createLocalResourceAdapters({ resourceStore, skillDiscovery, credentials });
+    t.after(() => adapters.close());
+  }
   const built = await build.build({ agentId, revision: 2, metadata: { id: agentId, name: 'Agent', local: true, revision: 2 }, spec: { runtime: { type: runtime }, bindings }, bindings });
   const portableBundles = createPortableBundles({ storeDir: root, build, models, adapters, configuration });
   const release = { id: '0.0.1-test', version: '0.0.1-test', label: 'Test', channel: 'preview', enabled: true, runtimeIdentity: true, image: `hub-vpc-cn-beijing-6.kce.ksyun.com/test/runtime@sha256:${'a'.repeat(64)}`,
@@ -28,7 +55,7 @@ async function fixture(t, { runtime = 'harness', credentialName = 'MODEL_KEY', c
   const control = { failNextDetail: null };
   let deleted = false;
   const client = {
-    inspectIdentity: async () => ({ kind: 'subaccount', accountId: 'owner', userUuid: 'actor', userName: 'operator' }),
+    inspectIdentity: async () => ({ kind: 'subaccount', accountId: deploymentType === 'ManagedRuntime' ? '123' : 'owner', userUuid: 'actor', userName: 'operator' }),
     getBootstrapConfig: async () => ({ data: { Product: 'agentkit-studio', ClientType: 'studio', Region: 'cn-beijing-6', Environment: 'pre-online',
       Capabilities: { ContainerStorage: { Contract: 'agentengine.container-storage/v1', Frameworks: ['harness', 'codex'], MinSizeGi: 20, MaxSizeGi: 500, MaxReplicas: 1, PaymentType: 'Daily' } }, Configs: { 'studio.runtime.images.v1': {
       format: 'agentkit.runtime-images/v1', environment: 'pre-online', region: 'cn-beijing-6', defaultReleaseId: release.id, releases: [release],
@@ -36,8 +63,11 @@ async function fixture(t, { runtime = 'harness', credentialName = 'MODEL_KEY', c
     createAgent: async payload => {
       calls.push(['create', payload]);
       if (createError && !responseLost) throw createError;
+      const managed = payload.DeploymentType === 'ManagedRuntime';
       Object.assign(remote, { Basic: { AgentId: cloudAgentId, Name: payload.Name, Status: initialStatus, ReadyReplicas: initialStatus === 'RUNNING' ? 1 : 0 },
-        Deployment: { ArtifactPath: payload.ContainerConfig.ImageAddr, Storage: payload.Storage }, Advanced: { EnvironmentVariables: payload.Advanced.EnvironmentVariables },
+        Deployment: managed
+          ? { DeploymentType: 'ManagedRuntime', ArtifactPath: payload.ManagedRuntimeConfig && release.image, RuntimeConfig: { Name: payload.ManagedRuntimeConfig.RuntimeName, Version: payload.ManagedRuntimeConfig.RuntimeVersion, ...(payload.ManagedRuntimeConfig.StudioBundleArtifact ? { StudioBundleArtifact: { SHA256: payload.ManagedRuntimeConfig.StudioBundleArtifact.SHA256 } } : {}) }, Storage: payload.Storage }
+          : { DeploymentType: 'Container', ArtifactPath: payload.ContainerConfig.ImageAddr, Storage: payload.Storage }, Advanced: { EnvironmentVariables: payload.Advanced.EnvironmentVariables },
         Network: { PublicEndpoint: `https://${cloudAgentId}.agent-pre.kspmas.ksyun.com` }, QuickAccess: { ApiKey: key } });
       if (createError) throw createError;
       return { data: { AgentId: cloudAgentId } };
@@ -67,7 +97,7 @@ async function fixture(t, { runtime = 'harness', credentialName = 'MODEL_KEY', c
       };
     },
   };
-  const options = { storeDir: join(root, 'deployments'), build, portableBundles, models, adapters, configuration, client,
+  const options = { storeDir: join(root, 'deployments'), build, portableBundles, models, adapters, credentials, configuration, client,
     operations: createOperationManager({ storeDir: join(root, 'operations') }),
     storageFactory: () => ({ upload: async (zip, reference) => {
       calls.push(['upload', reference]);
@@ -89,9 +119,9 @@ async function fixture(t, { runtime = 'harness', credentialName = 'MODEL_KEY', c
     },
   };
   const service = createStudioDeployments(options);
-  const input = { agentId, buildId: built.id, resources: { cpu: 2, memoryGiB: 8 } };
+  const input = { agentId, buildId: built.id, ...(deploymentType !== 'Container' ? { deploymentType } : {}), resources: { cpu: 2, memoryGiB: 8 } };
   const preview = await service.prepare(input);
-  const request = { ...input, bundleId: preview.bundleId, releaseId: preview.releaseId, previewId: preview.previewId, idempotencyKey: 'request-test-123456' };
+  const request = { ...input, bundleId: preview.bundleId, ...(deploymentType === 'ManagedRuntime' ? { bundleUploadId: preview.bundleUploadId } : {}), releaseId: preview.releaseId, previewId: preview.previewId, idempotencyKey: 'request-test-123456' };
   async function settled() {
     const deadline = performance.now() + 10_000;
     let records = [];
@@ -173,6 +203,148 @@ test('three runtimes create from a frozen Build, synchronize the platform token,
     await assert.rejects(() => f.service.agents.connect(ready.cloudAgentId), { code: 'DEPLOYMENT_DELETED' });
     await f.service.remove(first.id); assert.equal(f.calls.filter(([action]) => action === 'delete').length, 1);
   }
+});
+
+test('ManagedRuntime delivery skips KS3 for prompt and direct MCP-only bindings', async t => {
+  const f = await fixture(t, { runtime: 'harness', deploymentType: 'ManagedRuntime' });
+  const created = await f.service.create(f.request);
+  await f.settled();
+  const payload = f.calls.find(([action]) => action === 'create')[1];
+  assert.equal(payload.DeploymentType, 'ManagedRuntime');
+  assert.equal(payload.ManagedRuntimeConfig.RuntimeName, 'harness');
+  assert.equal(payload.ManagedRuntimeConfig.StudioBundleArtifact, undefined);
+  assert.match(payload.ManagedRuntimeConfig.Manifest, /artifact_type: ManagedRuntime/);
+  assert.match(payload.ManagedRuntimeConfig.Manifest, /mcp_servers:/);
+  assert.match(payload.ManagedRuntimeConfig.Manifest, /endpoint: https:\/\/search\.example\/mcp/);
+  assert.equal(payload.ModelConfig.Model, 'bound-model');
+  assert.equal(payload.Advanced.EnvironmentVariables.filter(row => row.Key.startsWith('MCP_STUDIO_')).length, 1);
+  assert.equal(f.calls.filter(([action]) => action === 'upload').length, 0);
+  assert.equal((await f.service.get(created.id)).state, 'READY');
+  const cloud = await f.service.agents.get('ar-cloud-test');
+  assert.equal(cloud.deployment.model, 'bound-model');
+});
+
+for (const deploymentType of ['ManagedRuntime', 'Container']) test(`${deploymentType} ships custom MCP Headers with a local Skill bundle using only sensitive environment values`, async t => {
+  const customMcp = { value: 'fixture-only-service-value' };
+  const loopback = await createMcpLoopbackService({ transport: 'http', credentialHeader: 'x-service-token', getCredential: () => customMcp.value });
+  t.after(() => loopback.close());
+  customMcp.endpoint = loopback.endpoint;
+  const f = await fixture(t, { deploymentType, customMcp });
+  assert.equal(f.preview.resourceCounts.mcps, 1);
+  assert.equal(f.preview.resourceCounts.skills, 1);
+  assert.ok(!JSON.stringify(f.preview).includes(customMcp.value));
+  const bundle = await f.options.portableBundles.download(f.input.agentId, f.input.buildId, f.preview.bundleId);
+  const archive = verifyPortableBundle(Buffer.from(bundle.base64, 'base64'));
+  assert.ok(!archive.files.some(file => file.name.endsWith('.studio-installation.json')));
+  assert.ok(!JSON.stringify(archive.manifest).includes('team/services.mcp'));
+  if (deploymentType === 'ManagedRuntime') {
+    const original = customMcp.value;
+    customMcp.value = 'fixture-only-rotated-value';
+    await assert.rejects(f.service.create(f.request), { code: 'DEPLOYMENT_PREVIEW_STALE' });
+    assert.deepEqual(f.calls, []);
+    customMcp.value = original;
+  }
+  const created = await f.service.create(f.request);
+  await f.settled();
+  const payload = f.calls.find(([action]) => action === 'create')[1];
+  const manifestConfig = payload.ManagedRuntimeConfig;
+  const binding = manifestConfig
+    ? managedResourceBindings(parseManagedRuntimeManifest(manifestConfig.Manifest, { runtimeName: manifestConfig.RuntimeName, runtimeVersion: manifestConfig.RuntimeVersion }).resources).mcpServers[0]
+    : archive.manifest.resources.mcps[0];
+  const envName = binding.envRefs['X-Service-Token'];
+  assert.match(envName, /^MCP_STUDIO_[A-F0-9]+_TOKEN$/);
+  const environment = payload.Advanced.EnvironmentVariables;
+  assert.deepEqual(environment.find(row => row.Key === envName), { Key: envName, Value: customMcp.value, IsSensitive: true });
+  assert.ok(!JSON.stringify(manifestConfig || {}).includes(customMcp.value));
+  assert.ok(!(await readFile(join(f.root, 'deployments', `${created.id}.json`), 'utf8')).includes(customMcp.value));
+  const served = createLocalResourceAdapters({ credentials: { resolve: async name => ({ value: environment.find(row => row.Key === name)?.Value }) } });
+  try { assert.equal((await served.callMcpTool(binding, loopback.toolName, {}))[0].text, loopback.receipt); }
+  finally { await served.close(); }
+  assert.equal(loopback.counts.authenticated, loopback.counts.requests);
+  assert.equal((await f.service.refresh(created.id)).state, 'READY');
+});
+
+test('Studio streams a managed deployment through public Responses with the observed runtime identity', async t => {
+  const f = await fixture(t, { runtime: 'dsh-native', deploymentType: 'ManagedRuntime' });
+  await f.service.create(f.request);
+  await f.settled();
+  const agentId = f.remote.Basic.AgentId;
+  const versionId = 'managed-target-version-1';
+  const { Manifest } = f.calls.find(([action]) => action === 'create')[1].ManagedRuntimeConfig;
+  const manifestSha256 = sha256(Manifest);
+  Object.assign(f.remote.Deployment.RuntimeConfig, { ManifestFormat: 'agentengine.dsh-manifest/v1', ManifestSha256: manifestSha256 });
+  f.remote.DeploymentState = { DesiredVersionId: versionId, ObservedVersionId: versionId, Ready: true };
+  const identity = { agentId, versionId, manifestSha256 };
+  const requests = [], traces = [];
+  let responseIdentity = identity;
+  const fetchImpl = async (url, init) => {
+    const { pathname } = new URL(url);
+    requests.push(pathname);
+    assert.equal(init.headers.Authorization, `Bearer ${f.remote.QuickAccess.ApiKey}`);
+    assert.equal(init.redirect, 'error');
+    if (pathname === '/v1/agentkit/runtime') return Response.json({ error: { code: 'RUNTIME_UNAUTHORIZED' } }, { status: 401 });
+    if (pathname === '/agentengine/api/v1/GetAgentUiBootstrap') {
+      assert.deepEqual(JSON.parse(init.body), { AgentId: agentId });
+      return Response.json({ Code: 0, Data: { Agent: { AgentId: agentId }, ApiFormats: ['responses'], Capabilities: {
+        ExecutionPolicy: { Format: 'agentkit.execution-policy/v1', Modes: ['read-only', 'workspace-write'], DefaultMode: 'workspace-write' },
+      } } });
+    }
+    assert.equal(pathname, '/v1/responses');
+    assert.equal(init.headers['x-agentkit-permission-mode'], 'workspace-write');
+    const contract = createRuntimeResponsesContract({ agentId: responseIdentity.agentId, versionId: responseIdentity.versionId,
+      definitionId: responseIdentity.manifestSha256, model: 'bound-model', token: 'test-managed-runtime-deployment-token' });
+    const events = [];
+    const writer = createRuntimeResponsesStream(contract.parse(JSON.parse(init.body)), (_type, value) => events.push(value));
+    writer.start();
+    writer.frame({ kind: 'assistant', value: { type: 'chunk', attemptId: 'first', chunk: { type: 'text-delta', index: 0, text: 'OK' } } });
+    writer.frame({ kind: 'assistant', value: { type: 'end', attemptId: 'first', outcome: { kind: 'committed', eventType: 'assistant/message' } } });
+    writer.complete({ output: 'OK' });
+    return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'Content-Type': 'text/event-stream' } });
+  };
+  const service = createStudioDeployments({ ...f.options, fetchImpl });
+  const stream = createDeploymentConversation({ agents: async () => service.agents, fetchImpl,
+    permissionModeFor: async () => 'workspace-write', observability: { syncTrace: async trace => traces.push(trace) } });
+  const deltas = [];
+  const run = async () => {
+    for await (const frame of stream({ agentId, provider: CLOUD_PROVIDER, model: 'bound-model', input: 'Reply OK',
+      userMessage: { id: 'message-1' }, sessionId: 'studio-session' })) {
+      if (frame.type === 'text-delta') deltas.push(frame.text);
+    }
+  };
+  await run();
+  assert.equal(deltas.join(''), 'OK');
+  assert.deepEqual(requests, ['/agentengine/api/v1/GetAgentUiBootstrap', '/v1/responses']);
+  assert.equal(traces[0].provenance.runtimeVersionId, versionId);
+  for (const mismatched of [{ versionId: 'other-version' }, { manifestSha256: 'f'.repeat(64) }, { agentId: 'ar-other' }]) {
+    responseIdentity = { ...identity, ...mismatched };
+    await assert.rejects(run, { code: 'DEPLOYMENT_RESPONSE_MISMATCH' });
+  }
+  assert.deepEqual(deltas, ['OK']);
+  const previousRequests = requests.length;
+  f.remote.DeploymentState.ObservedVersionId = 'stale-version';
+  await assert.rejects(run, { code: 'DEPLOYMENT_NOT_READY' });
+  assert.equal(requests.length, previousRequests);
+});
+
+test('ManagedRuntime maps Skill Center, knowledge base and memory without a bundle artifact', async t => {
+  const f = await fixture(t, { runtime: 'codex', deploymentType: 'ManagedRuntime', bindings: {
+    mcpServers: [],
+    plugins: [
+      { enabled: true, config: { binding: { resource: { kind: 'knowledge-base', id: 'kb-1' } } } },
+      { enabled: true, config: { binding: { resource: { kind: 'memory-instance', id: 'memory-1' } } } },
+      { enabled: true, config: { binding: { resource: { kind: 'skill-space', id: 'space-1' } } } },
+    ],
+  } });
+  await f.service.create(f.request);
+  await f.settled();
+  const payload = f.calls.find(([action]) => action === 'create')[1];
+  assert.equal(payload.ManagedRuntimeConfig.StudioBundleArtifact, undefined);
+  assert.match(payload.ManagedRuntimeConfig.Manifest, /knowledge_base:/);
+  assert.match(payload.ManagedRuntimeConfig.Manifest, /memory:/);
+  assert.match(payload.ManagedRuntimeConfig.Manifest, /skill_spaces:/);
+  assert.match(payload.ManagedRuntimeConfig.Manifest, /id: space-1/);
+  assert.deepEqual(payload.ComponentConfig, { KnowledgeBase: { Id: 'kb-1' }, Memory: { Id: 'memory-1' } });
+  assert.equal(f.calls.filter(([action]) => action === 'upload').length, 0);
 });
 
 test('unset bucket uses verified account and physical region, retaining an isolated private bundle prefix', async t => {
@@ -541,7 +713,7 @@ test('in-place upgrades and exact rollbacks require serving identity; all runtim
     const pending = await f.service.applyUpdate(preview); await f.settled();
     assert.equal(pending.state, 'UPDATING');
     const patch = f.calls.filter(([action]) => action === 'update').at(-1)[1];
-    assert(patch.EnvironmentVariablePatch.Delete.some(key => key.startsWith('AGENTKIT_BUNDLE_MCP_')));
+    assert(patch.EnvironmentVariablePatch.Delete.some(key => key.startsWith('MCP_STUDIO_')));
     assert(!patch.EnvironmentVariablePatch.Delete.includes('KSYUN_SECRET_KEY'));
     assert.equal(f.remote.Advanced.EnvironmentVariables.find(row => row.Key === 'KSYUN_SECRET_KEY').Value, 'platform-injected');
     assert.equal((await f.service.refresh(initial.id)).state, 'UPDATING', 'new control-plane fields and healthy old pod must not pass');

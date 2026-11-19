@@ -4,6 +4,8 @@ import { syncGlobalModelCredential } from './model-credential-sync.mjs';
 import { studioReasoning } from './model-reasoning.mjs';
 import { createHash } from 'node:crypto';
 import { modelCatalogLimits, admitModelCapabilities } from '@kingsoftcloud/agentkit-harness-core/model-capabilities';
+import { requestHeaders } from './model-profile-contract.mjs';
+import { probeModelWire } from './model-wire-probe.mjs';
 
 function inputModalities(model = {}) {
   // KSPMAS/OpenAI-compatible gateways expose capabilities under
@@ -80,12 +82,21 @@ export function createModelService({ configuration, credentials, fetchImpl = hos
       baseUrl: baseUrl.replace(/\/$/, ''), apiKey: key };
   }
   async function gatewayModels(selected, refresh = false) {
-    const key = createHash('sha256').update(selected.baseUrl + '\0' + selected.apiKey).digest('hex');
+    // A gateway can gate `/models` behind its own header, so the profile's
+    // configured request headers reach the catalog read. Configuration wins
+    // over the credential-derived Authorization: an explicitly configured
+    // header is the caller's intent. With no headers configured the request is
+    // byte-for-byte the same as before, and the cache key only grows when
+    // headers exist so unrelated profiles keep sharing one catalog.
+    const configured = requestHeaders(selected.headers);
+    const fingerprint = Object.keys(configured).length
+      ? '\0' + JSON.stringify(Object.entries(configured).sort(([left], [right]) => left.localeCompare(right))) : '';
+    const key = createHash('sha256').update(selected.baseUrl + '\0' + selected.apiKey + fingerprint).digest('hex');
     const cached = catalogs.get(key);
     if (!refresh && cached && cached.expires > Date.now()) return cached.items;
     if (pendingCatalogs.has(key)) return pendingCatalogs.get(key);
     const operation = (async () => {
-    const response = await fetchImpl(`${selected.baseUrl}/models`, { headers: { Authorization: `Bearer ${selected.apiKey}` }, signal: AbortSignal.timeout(15000), redirect: 'error' });
+    const response = await fetchImpl(`${selected.baseUrl}/models`, { headers: { Authorization: `Bearer ${selected.apiKey}`, ...configured }, signal: AbortSignal.timeout(15000), redirect: 'error' });
     if (!response.ok) throw Object.assign(new Error(`读取模型目录失败（${response.status}）`), { code: 'MODEL_CATALOG_FAILED' });
     const data = await response.json();
     const items = (data.data || data.models || []).filter(item => typeof item.id === 'string').map(item => ({ id: item.id, name: item.name || item.id, input: modelInput(item),
@@ -118,7 +129,9 @@ export function createModelService({ configuration, credentials, fetchImpl = hos
     try { url = new URL(baseUrl); } catch { /* validated below */ }
     if (!url || !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
       throw Object.assign(new Error('模型 API 地址无效'), { code: 'MODEL_URL_INVALID', status: 400 });
-    const items = await gatewayModels({ baseUrl: url.href.replace(/\/$/, ''), apiKey }, true);
+    // Probe with the headers the form is about to save, so a header-gated
+    // gateway can be read before the profile is persisted.
+    const items = await gatewayModels({ baseUrl: url.href.replace(/\/$/, ''), apiKey, ...(candidate.headers ? { headers: candidate.headers } : {}) }, true);
     const modelName = String(candidate.modelName || '').trim();
     return {
       provider,
@@ -128,6 +141,30 @@ export function createModelService({ configuration, credentials, fetchImpl = hos
       selectedAvailable: !modelName || items.some(item => item.id === modelName),
       items,
     };
+  }
+  /**
+   * Ask one model which wire it speaks.
+   *
+   * The catalog cannot answer this — 星流's `/v1/models` declares no
+   * `native_endpoints` and no capability flag — so the settings form offers a
+   * probe instead of guessing. The probe never writes configuration: the form
+   * shows the recommendation and the operator decides.
+   *
+   * The credential is resolved from the same store the save path uses, so a
+   * profile that has never had its key re-entered can still be probed.
+   */
+  async function probeWire(candidate = {}) {
+    const baseUrl = String(candidate.baseUrl || '').trim().replace(/\/+$/, '');
+    const modelName = String(candidate.modelName || '').trim();
+    if (!baseUrl || !modelName)
+      throw Object.assign(new Error('探测需要模型地址与模型名'), { code: 'MODEL_PROBE_INPUT_INVALID', status: 400 });
+    let apiKey = String(candidate.apiKey || '').trim();
+    if (!apiKey) {
+      try { apiKey = String((await credentials.resolve(candidate.credentialName || 'AGENTKIT_MODEL_API_KEY'))?.value || '').trim(); }
+      catch { apiKey = ''; }
+    }
+    const wire = await probeModelWire({ baseUrl, modelName, apiKey, headers: requestHeaders(candidate.headers) });
+    return { baseUrl, modelName, wire };
   }
   async function capabilities(selected, signal) {
     signal?.throwIfAborted();
@@ -152,5 +189,5 @@ export function createModelService({ configuration, credentials, fetchImpl = hos
     if (!apiKey || !baseUrl) return admitModelCapabilities(candidate);
     return capabilities({ ...candidate, baseUrl, apiKey }, signal);
   }
-  return { settings, save, create, sync, profile, catalog, probe, capabilities, capabilitiesOf };
+  return { settings, save, create, sync, profile, catalog, probe, probeWire, capabilities, capabilitiesOf };
 }
