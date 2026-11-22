@@ -316,3 +316,34 @@ test('Delivery embedded in an Agent locks the target, drops the picker and scope
   assert.equal(ui.field('显示已删除的部署记录'), undefined);
   assert.ok(ui.button('构建当前版本'));
 });
+
+test('each step shows its state, edits in a field grid, states fixed values and keeps the checked plan inside the deploy step', async () => {
+  const page = harness('DeliveryPage', { agentId: 'a' });
+  page.api.agents = async () => ({ items: [{ metadata: { id: 'a', revision: 2, local: true } }] });
+  page.api.agent = async () => ({ metadata: { id: 'a', revision: 2, local: true }, builds: [{ id: 'old', revision: 1, status: 'SUCCEEDED' }] });
+  await page.settle();
+  const build = page.nodes().find(node => node.props['data-delivery-section'] === 'build');
+  assert.ok(build.children.flatMap(child => child.children || []).some(node => node.props?.className === 'af-section-side' && page.text(node) === '需要重新构建'));
+  const headline = page.nodes().find(node => node.props.className === 'ad-headline');
+  assert.match(page.text(headline), /配置已更新到 r2.*重新构建后.*构建当前版本/);
+  assert.deepEqual(headline.children[1].children, [page.field('构建版本'), page.button('构建当前版本')]);
+  assert.equal(page.nodes().some(node => typeof node.props.className === 'string' && node.props.className.includes('af-row')), false);
+
+  const ui = harness();
+  ui.rows.push({ id: 'live', agentId: 'a', agentName: 'Live', state: 'READY', cloudAgentId: 'cloud-a', buildId: 'old', resources: { cpu: 2, memoryGiB: 4 } });
+  ui.api.prepareDeploymentUpdate = async request => ({ ...preview({ resources: {} }), deploymentId: request.deploymentId });
+  await ui.settle();
+  const deploy = () => ui.nodes().find(node => node.props['data-delivery-section'] === 'deploy');
+  const within = (root, node) => root === node || (root?.children || []).some(child => within(child, node));
+  assert.ok(ui.nodes().some(node => node.props.className === 'studio-st' && node.props['data-tone'] === 'ok' && ui.text(node) === '已部署'));
+  const fields = ui.nodes().find(node => node.props.className === 'ad-fields');
+  assert.ok(within(fields, ui.field('部署目标')) && within(fields, ui.field('使用推荐运行镜像')));
+  const facts = ui.nodes().find(node => node.type === 'dl' && node.props.className === 'ad-facts');
+  assert.match(ui.text(facts), /实例规格2 核 \/ 4 GB.*对话存储20 GiB 持久化云盘挂载 \/home\/node · 按天计费/);
+  assert.equal(within(deploy(), ui.field('部署检查结果')), false);
+  await ui.button('检查更新').props.onClick(); await ui.settle();
+  assert.ok(within(deploy(), ui.field('部署检查结果')), 'the checked plan belongs to the deploy step');
+  const empty = harness(); await empty.settle();
+  assert.ok(empty.nodes().some(node => node.props.className === 'af-note ad-empty' && /尚未部署/.test(empty.text(node))));
+  assert.ok(empty.nodes().some(node => node.props.className === 'studio-st' && node.props['data-tone'] === 'neutral' && empty.text(node) === '未部署'));
+});
