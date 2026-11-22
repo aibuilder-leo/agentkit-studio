@@ -75,8 +75,8 @@ export default String.raw`
 .studio-list-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding-top: 12px; border-top: .5px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); font-size: 12px; }
 .studio-page-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
 .studio-page-header h1 { margin: 0; font-size: 20px; line-height: 28px; font-weight: 500; color: var(--dsw-alias-label-primary); }
-.studio-agent-hub:has([data-studio-agent-form]) > [data-studio-drag-region] { display: none; }
-.studio-agent-hub:has([data-studio-agent-form]) > [data-agentkit-studio] { padding-top: 28px !important; }
+.studio-agent-hub:has(:is([data-studio-agent-form],[data-studio-agent-detail])) > [data-studio-drag-region] { display: none; }
+.studio-agent-hub:has(:is([data-studio-agent-form],[data-studio-agent-detail])) > [data-agentkit-studio] { padding-top: 28px !important; }
 .studio-toolbar-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .studio-toolbar-controls > button { width: 32px; border: 0; padding: 0; }
 .studio-pick-quiet { width: auto !important; height: 32px !important; margin: 0 !important; border: 0 !important; box-shadow: none !important; background-color: transparent !important; color: var(--dsw-alias-label-secondary); font-size: 13px; }

@@ -102,16 +102,15 @@ test('Agent rows consolidate metadata while retaining keyboard and action dispat
 
 test('local rows expose one build or deploy next step and keep conversation binding', async () => {
   for (const built of [false, true]) {
-    const routes = [], events = [], stored = [], bound = [];
+    const routes = [], delivered = [], bound = [];
     const agent = { metadata: { id: 'a', local: true, revision: 2 }, builds: built ? [{ status: 'SUCCEEDED', revision: 2 }] : [] };
-    const window = { localStorage: { setItem: (...args) => stored.push(args) }, dispatchEvent: event => events.push(event) };
-    const nodes = render([agent], '', { onNavigate: route => routes.push(route), onBindAgent: value => bound.push(value) }, [], false, 'ready', window);
+    const nodes = render([agent], '', { onNavigate: route => routes.push(route), onDeliver: (...args) => delivered.push(args), onBindAgent: value => bound.push(value) });
     const next = nodes.find(node => node.type === 'button' && node.children.includes(built ? '部署' : '构建'));
     assert.equal(next.props['data-variant'], 'outline');
     next.props.onClick({ stopPropagation() {} });
-    assert.equal(JSON.parse(stored[0][1]).section, built ? 'deploy' : 'build');
-    assert.equal(events[0].type, 'agentkit-studio:operations-focus');
-    assert.deepEqual(routes, ['studio-operations']);
+    // Build and deployment open inside the Agent; the list no longer leaves for the operations center.
+    assert.deepEqual(delivered, [[agent, built ? 'deploy' : 'build']]);
+    assert.deepEqual(routes, []);
     const chat = nodes.find(node => node.type === 'button' && node.children.includes('对话'));
     assert.equal(chat.props['data-variant'], 'ghost');
     await chat.props.onClick({ stopPropagation() {} });
@@ -124,11 +123,63 @@ test('local rows expose one build or deploy next step and keep conversation bind
 });
 
 test('cloud deployment rows focus the owning local Agent and the clicked instance', () => {
-  const routes = [], events = [];
+  const routes = [], delivered = [];
   const agent = { source: 'studio-deployment', metadata: { id: 'ar-cloud-b' }, deployment: { id: 'dep-b', agentId: 'ar-local-b', state: 'READY' } };
-  const window = { dispatchEvent: event => events.push(event) };
-  const nodes = render([agent], '', { tab: 'cloud', onNavigate: route => routes.push(route) }, [], false, 'ready', window);
+  const nodes = render([agent], '', { tab: 'cloud', onNavigate: route => routes.push(route), onDeliver: (...args) => delivered.push(args) });
   nodes.find(node => node.type === 'button' && node.children.includes('管理部署')).props.onClick({ stopPropagation() {} });
-  assert.deepEqual(routes, ['studio-operations']);
-  assert.deepEqual(events[0].detail, { tab: 'delivery', agentId: 'ar-local-b', deploymentId: 'dep-b', section: 'deploy' });
+  assert.deepEqual(delivered, [[agent, 'deploy']]);
+  assert.deepEqual(routes, []);
+});
+
+function workspace(agentsPageProps = []) {
+  const slots = [];
+  let cursor = 0;
+  const h = (type, props, ...children) => ({ type, props: props || {}, children: children.flat(Infinity).filter(item => item !== null && item !== undefined && item !== false) });
+  const useState = initial => { const index = cursor++; if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial; return [slots[index], value => { slots[index] = typeof value === 'function' ? value(slots[index]) : value; }]; };
+  const pages = createAgentPages({ ui: { React: { Fragment: 'fragment', createElement: h, useState, useEffect() {}, useRef: () => ({ current: 0 }) }, Menu: 'menu', MenuItemButton: 'menuitem', BRAND: {}, inputStyle: () => ({}), buttonStyle: () => ({}), pagerButtonStyle: () => ({}), StudioSubnav: 'nav', RuntimeCatalogPage: 'runtime', EmptyState: 'empty', Pill: 'pill', RUNTIME_LABELS: { codex: 'Codex Agent' }, DEPLOYMENT_LABELS: {}, AgentCreatePage: 'create', AgentEditPage: 'edit', DeliveryPage: 'delivery' },
+    window: { addEventListener() {}, removeEventListener() {}, dispatchEvent() {} }, hostRemote: {}, actions: { bindAgent: id => agentsPageProps.push(['bind', id]) } });
+  return { pages, render: (Component, props) => { cursor = 0; return Component(props); }, slots };
+}
+
+test('the Agent workspace opens build and deployment inside the owning Agent', () => {
+  const { pages, render } = workspace();
+  let tree = render(pages.AgentWorkspace, {});
+  tree.props.onDeliver({ source: 'studio-deployment', metadata: { id: 'ar-cloud-b' }, deployment: { id: 'dep-b', agentId: 'ar-local-b' } }, 'deploy');
+  tree = render(pages.AgentWorkspace, {});
+  assert.equal(tree.type, pages.AgentDetailPage);
+  assert.equal(tree.props.initialPanel, 'delivery');
+  assert.deepEqual(tree.props.initialFocus, { agentId: 'ar-local-b', section: 'deploy', deploymentId: 'dep-b' });
+  assert.equal(tree.props.agent.id, 'ar-local-b');
+  assert.equal(tree.props.agent.chatId, 'ar-cloud-b');
+  tree.props.onBack();
+  tree = render(pages.AgentWorkspace, {});
+  tree.props.onEdit({ metadata: { id: 'managed' }, managedRuntime: true });
+  tree = render(pages.AgentWorkspace, {});
+  assert.equal(tree.props.initialPanel, 'config');
+  assert.equal(tree.props.agent.deliverable, false);
+});
+
+test('the Agent detail keeps configuration mounted and continues with the build step after saving', () => {
+  const calls = [], { pages, render } = workspace(calls);
+  const agent = { id: 'a', chatId: 'a', name: '助手', revision: 1, runtime: 'codex', deliverable: true };
+  const props = { agent, initialPanel: 'delivery', initialFocus: { agentId: 'a', section: 'deploy' }, onBack() {}, onSaved: value => calls.push(['saved', value]), onBindAgent: id => calls.push(['bind', id]) };
+  let nodes = walk(render(pages.AgentDetailPage, props));
+  assert.deepEqual(nodes.find(node => node.type === 'nav').props.items.map(item => item.label), ['配置', '构建与部署']);
+  assert.deepEqual(nodes.find(node => node.type === 'delivery').props, { agentId: 'a', focus: { agentId: 'a', section: 'deploy' } });
+  const form = nodes.find(node => node.type === 'edit');
+  assert.equal(form.props.embedded, true);
+  assert.equal(nodes.find(node => node.props['data-agent-panel'] === 'config').props.hidden, true);
+  assert.ok(nodes.some(node => node.props.className === 'studio-row-meta' && node.children.includes('Codex Agent · r1')));
+  nodes.find(node => node.type === 'nav').props.onChange('config');
+  nodes = walk(render(pages.AgentDetailPage, props));
+  assert.equal(nodes.some(node => node.type === 'delivery'), false);
+  assert.equal(nodes.find(node => node.props['data-agent-panel'] === 'config').props.hidden, false);
+  nodes.find(node => node.type === 'edit').props.onSaved({ id: 'a', name: '助手', revision: 2 });
+  nodes = walk(render(pages.AgentDetailPage, props));
+  assert.deepEqual(calls, [['saved', { id: 'a', name: '助手', revision: 2 }]]);
+  assert.deepEqual(nodes.find(node => node.type === 'delivery').props.focus, { agentId: 'a', section: 'build' });
+  assert.equal(nodes.find(node => node.type === 'edit').props.key, 1);
+  assert.ok(nodes.some(node => node.props.role === 'status' && node.children.join('').includes('r2')));
+  const unmanaged = walk(render(workspace().pages.AgentDetailPage, { ...props, agent: { ...agent, deliverable: false } }));
+  assert.equal(unmanaged.some(node => node.type === 'nav' || node.type === 'delivery'), false);
 });

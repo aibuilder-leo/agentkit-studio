@@ -26,7 +26,7 @@ export function createAgentForm({
   const Row = ({ help, title, ...props }, ...children) => FormRow({ ...props, title: help ? h('span', { title: help }, title) : title, className: 'af-row studio-srow' }, ...children);
   const Note = (props, ...children) => FormNote({ title: children.every(child => typeof child === 'string') ? children.join('') : undefined, ...props }, ...children);
   const nativeRoleFields = createNativeRoleFields({ React, kit });
-  function AgentCreatePage({ initialAgent = null, creationSeed = null, onBack, onCreated, onReload, allowHarnessRuntime = false }) {
+  function AgentCreatePage({ initialAgent = null, creationSeed = null, onBack, onCreated, onReload, allowHarnessRuntime = false, embedded = false }) {
     const editing = Boolean(initialAgent);
     const cloudEditing = editing && ['agentengine-server', 'agentengine-managed-runtime'].includes(initialAgent?.source);
     const originalSpec = initialAgent?.spec || creationSeed?.spec || {};
@@ -156,6 +156,9 @@ export function createAgentForm({
     const canNext = creatableRuntime(form.runtime) && (step === 0
       ? Boolean(form.id.trim() && form.name.trim())
       : cloudEditing || (catalogStatus === 'ready' && Boolean(selectedModel) && bindingReady));
+    // Editing lands on any step, so saving is offered on every step and gated by all steps' requirements.
+    const canSave = creatableRuntime(form.runtime) && Boolean(form.id.trim() && form.name.trim())
+      && (cloudEditing || (catalogStatus === 'ready' && Boolean(selectedModel) && bindingReady));
 
     const create = async () => {
       if (!creatableRuntime(form.runtime)) { setError('请先在插件页启用 Star Harness。'); setStep(0); return; }
@@ -359,9 +362,9 @@ export function createAgentForm({
           ['模板', creationSeed?.name || templateSource?.id || templates.find(item => item[0] === form.template)?.[1]]] }),
         editing ? Note({ style: { marginTop: '12px' } }, cloudEditing ? '保存后调用 AgentEngine UpdateAgent；云端已有会话继续使用旧快照，新运行使用更新后的组件绑定。' : `保存后创建新的配置版本（当前 r${initialAgent.metadata.revision}）；已有会话和构建不会被自动切换。`) : null),
     );
-    return h('div', { 'data-studio-agent-form': true },
-      Button({ onClick: onBack, variant: 'ghost', size: 'sm', className: 'af-back', 'aria-label': creationSeed ? '返回模板' : '返回 Agents', title: creationSeed ? '返回模板' : '返回 Agents' }, '‹ 智能体'),
-      h('header', { 'data-studio-heading': 'true', className: 'af-page-heading' },
+    return h('div', { 'data-studio-agent-form': true, 'data-embedded': embedded || undefined },
+      embedded ? null : Button({ onClick: onBack, variant: 'ghost', size: 'sm', className: 'af-back', 'aria-label': creationSeed ? '返回模板' : '返回 Agents', title: creationSeed ? '返回模板' : '返回 Agents' }, '‹ 智能体'),
+      embedded ? null : h('header', { 'data-studio-heading': 'true', className: 'af-page-heading' },
         h(SectionHeading, { compact: true, title: editing ? '编辑 Agent' : creationSeed ? '配置你的专家' : '手动配置 Agent' })),
       h('section', { className: 'af-layout' },
         h('nav', { className: 'af-steps', 'aria-label': '创建流程' }, steps.map((label, index) => h('button', {
@@ -375,8 +378,9 @@ export function createAgentForm({
           h('div', { className: 'af-footer' },
             Button({ variant: 'ghost', className: 'af-cancel', onClick: onBack }, '取消'),
             step > 0 ? Button({ variant: 'outline', onClick: () => setStep(step - 1) }, '上一步') : null,
-            step < steps.length - 1 ? Button({ variant: 'primary', disabled: !canNext, onClick: () => setStep(step + 1) }, '下一步')
-              : Button({ variant: 'primary', disabled: saving || !canNext, onClick: create }, saving ? '保存中…' : editing ? '保存 Agent' : '创建 Agent'))
+            step < steps.length - 1 ? Button({ variant: editing ? 'outline' : 'primary', disabled: !canNext, onClick: () => setStep(step + 1) }, '下一步') : null,
+            editing || step === steps.length - 1
+              ? Button({ variant: 'primary', disabled: saving || !(editing ? canSave : canNext), onClick: create }, saving ? '保存中…' : editing ? '保存 Agent' : '创建 Agent') : null)
         )
       )
     );

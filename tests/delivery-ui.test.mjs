@@ -300,3 +300,19 @@ test('deployment failure remains a one-line alert without changing retry availab
   assert.equal(ui.button('检查部署').props.disabled, false);
   assert.equal(ui.field('部署检查结果'), undefined);
 });
+
+test('Delivery embedded in an Agent locks the target, drops the picker and scopes records to that Agent', async () => {
+  const ui = harness('DeliveryPage', { agentId: 'b', focus: { agentId: 'b', section: 'build' } });
+  ui.api.agents = async () => ({ items: [{ metadata: { id: 'a' } }, { metadata: { id: 'b', local: true } }] });
+  const hydrated = [];
+  ui.api.agent = async id => { hydrated.push(id); return { metadata: { id, local: true }, builds: [] }; };
+  ui.rows.push({ id: 'dep-other', agentId: 'a', agentName: 'Other', cloudAgentId: 'cloud-a', state: 'FAILED', failure: { code: 'X', message: 'failed' }, createdAt: '2026-01-01' });
+  await ui.settle();
+  assert.deepEqual(hydrated, ['b']);
+  assert.equal(ui.field('目标 Agent'), undefined);
+  assert.equal(ui.nodes().find(node => node.props['data-studio-delivery']).props['data-embedded'], 'true');
+  assert.equal(ui.nodes().some(node => node.type === 'StudioPageTabs'), false);
+  assert.equal(ui.nodes().some(node => ui.text(node).includes('其他 Agent 有')), false);
+  assert.equal(ui.field('显示已删除的部署记录'), undefined);
+  assert.ok(ui.button('构建当前版本'));
+});
