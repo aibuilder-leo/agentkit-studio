@@ -20,6 +20,14 @@ test('Studio disables the independent DSH account welcome and recharge flow', as
   assert.equal(entries.find(entry => entry.id === 'ui-settings-account')?.disabled, true);
 });
 
+test('Studio configures the existing DSH Agent preset registry', async () => {
+  const entries = parse(await readFile(resolve(import.meta.dirname, '../cordis.patch.yml'), 'utf8'));
+  const inserted = entries.flatMap(entry => entry.insert ?? []);
+  assert.ok(!inserted.some(entry => entry.id === 'agent-preset-registry'),
+    'dsh-web-app already inserts the registry; a second row blocks settings writes');
+  assert.equal(entries.find(entry => entry.id === 'agent-preset-registry')?.config?.default, 'standard');
+});
+
 const clientSource = await readClientSource();
 
 test('Studio mounts the official plugin navigation provider required by optional DSH UI bundles', async () => {
@@ -99,6 +107,10 @@ test('parent Studio mounting preserves local composer services and never install
   });
   assert.ok(registered.some(entry => entry.name === 'conversation.hero.agentPreset'), 'native authoring entry remains installed');
   assert.ok(registered.some(entry => entry.name === 'main' && entry.key === 'studio-overview'), 'declared panel remains installed');
+  const headerActions = registered.filter(entry => entry.name === 'conversation.session.header.actions').map(entry => entry.id);
+  assert.ok(headerActions.includes('agentkit-studio-cloud-status'));
+  assert.ok(headerActions.includes('agentkit-studio-native-children'));
+  assert.ok(!headerActions.includes('agentkit-studio-native-approval'), 'the conversation header must not poll the retired approval API');
   assert.equal(injected.includes('conversation.input.left'), false);
   assert.equal(registered.some(entry => entry.name === 'conversation.input.left' || entry.id === 'studio.assistant.attachment'), false);
   assert.equal(ctx.conversation, composer);
@@ -109,7 +121,9 @@ test('parent Studio mounting preserves local composer services and never install
 
 test('model settings keep multiple providers and profiles independently configurable', () => {
   assert.match(clientSource, /modelProfiles/);
-  assert.match(clientSource, /添加提供商或模型/);
+  assert.match(clientSource, /添加提供商/);
+  assert.match(clientSource, /移除提供商/);
+  assert.match(clientSource, /从目录添加模型/);
   assert.match(clientSource, /modelProfileKeys/);
   assert.match(clientSource, /ksp\.console\.ksyun\.com\/#\/apiKey/);
   assert.match(clientSource, /applyProfiles/);

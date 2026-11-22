@@ -9,7 +9,6 @@ import { createAgentSelector } from "./dsh/agent-selector.mjs";
 import { createCloudPermissionPresentation } from './dsh/cloud-permission.mjs';
 import { createCloudSessionStatus } from "./dsh/cloud-status.mjs";
 import { createNativeChildPanel } from "./dsh/native-children.mjs";
-import { createNativeApprovalPanel } from './dsh/native-approval.mjs';
 import { createNavigation } from "./components/navigation.mjs";
 import { createRuntimeCatalogPage } from "./pages/runtime-catalog.mjs";
 import { createNativeAuthoringButton } from "./dsh/native-authoring.mjs";
@@ -51,15 +50,15 @@ import { createStudioTeamPages } from './pages/studio-teams.mjs';
 import { createTemplateResourcePages } from './pages/template-resource-library.mjs';
 
 /** Build one presentation graph and one set of owners for each apply(ctx). */
-export function createStudioApp({ React, ReactDOM, primitives, ConversationNodeAssembler, nativeModules }, { window = globalThis.window, document = globalThis.document, CustomEvent = globalThis.CustomEvent, MutationObserver = globalThis.MutationObserver } = {}) {
+export function createStudioApp({ React, ReactDOM, primitives, ConversationNodeAssembler, nativeModules, harnessUI, harnessUIError }, { window = globalThis.window, document = globalThis.document, CustomEvent = globalThis.CustomEvent, MutationObserver = globalThis.MutationObserver } = {}) {
   let closed = false;
 
   /** Show only the value just typed; stored credentials are never read back. */
   const { SecretInput, StudioMark, StudioWordmark, Pill, SectionHeading, OperationalPageHeading, OperationalPanel, ContentIntro, Metric, EmptyState, DisabledAction } = createStudioPrimitives({ React, ReactDOM });
   const { inputStyle, buttonStyle, pagerButtonStyle } = createFormStyles(BRAND);
   const ResourceDialog = createResourceDialog({ React, buttonStyle });
-  const { IconSettingsOutlineMedium, IconChevronDownOutlineRegular, Menu, MenuItemButton, Input, Tooltip, Modal, MarkdownText, MarkdownDelegateProvider, DisclosureRow, StateDot, ImageLightbox, FileTypeIcon, Button, RiskConfirmation } = primitives;
-  const ui = { React, ReactDOM, BRAND, PANELS, ALLOWED_RUNTIME_TYPES, RUNTIME_LABELS, DEPLOYMENT_LABELS, SecretInput, StudioMark, StudioWordmark, Pill, SectionHeading, OperationalPageHeading, OperationalPanel, ContentIntro, Metric, EmptyState, DisabledAction, inputStyle, buttonStyle, pagerButtonStyle, ResourceDialog, IconSettingsOutlineMedium, IconChevronDownOutlineRegular, Menu, MenuItemButton, Input, Tooltip, Modal, MarkdownText, MarkdownDelegateProvider, DisclosureRow, StateDot, ImageLightbox, FileTypeIcon, Button, RiskConfirmation };
+  const { IconSettingsOutlineMedium, IconChevronDownOutlineRegular, Menu, MenuItemButton, Input, Tooltip, Modal, MarkdownText, MarkdownDelegateProvider, DisclosureRow, StateDot, ImageLightbox, FileTypeIcon, Button } = primitives;
+  const ui = { React, ReactDOM, BRAND, PANELS, ALLOWED_RUNTIME_TYPES, RUNTIME_LABELS, DEPLOYMENT_LABELS, SecretInput, StudioMark, StudioWordmark, Pill, SectionHeading, OperationalPageHeading, OperationalPanel, ContentIntro, Metric, EmptyState, DisabledAction, inputStyle, buttonStyle, pagerButtonStyle, ResourceDialog, IconSettingsOutlineMedium, IconChevronDownOutlineRegular, Menu, MenuItemButton, Input, Tooltip, Modal, MarkdownText, MarkdownDelegateProvider, DisclosureRow, StateDot, ImageLightbox, FileTypeIcon, Button };
   const { STUDIO_VERSION, STUDIO_PLUGIN_VERSION, DSH_VERSION } = readProductVersions(window.__AGENTKIT_STUDIO__);
   const connectionOwner = createConnectionOwner();
   const hostRemote = createProductClient(connectionOwner.connection, { window });
@@ -83,8 +82,9 @@ export function createStudioApp({ React, ReactDOM, primitives, ConversationNodeA
   ui.AgentContextSelector = createAgentSelector({ ui, hostRemote, readConversationAgent, writeConversationAgent });
   ui.CloudPermissionPresentation = createCloudPermissionPresentation({ ui, hostRemote, window });
   ui.CloudSessionStatus = createCloudSessionStatus({ ui, hostRemote });
-  ui.NativeChildPanel = createNativeChildPanel({ ui, hostRemote });
-  ui.NativeApprovalPanel = createNativeApprovalPanel({ ui, hostRemote });
+  ui.NativeChildPanel = createNativeChildPanel({ ui, hostRemote }, harnessUI?.createNativeChildPanel);
+  ui.installHarnessTimeline = harnessUI?.installTaskTimeline;
+  ui.harnessUIError = harnessUIError;
   ui.RuntimeCatalogPage = createRuntimeCatalogPage({ ui, hostRemote, window, CustomEvent });
   ui.DomainPage = createDomainPage({ ui });
   Object.assign(ui, createResourceDialogs({ ui, hostRemote, window, CustomEvent }));
@@ -110,7 +110,7 @@ export function createStudioApp({ React, ReactDOM, primitives, ConversationNodeA
   Object.assign(ui, createTemplateResourcePages({ ui, hostRemote, window, CustomEvent }));
   Object.assign(ui, createStudioShell({ ui, hostRemote, documentEffects }));
   ui.StudioSettingsLauncher = createSettingsLauncher({ ui, window });
-  ui.StudioSettingsSection = createStudioSettingsSection({ ui, hostRemote, window, versions: { STUDIO_VERSION, STUDIO_PLUGIN_VERSION, DSH_VERSION } });
+  ui.StudioSettingsSection = createStudioSettingsSection({ ui, hostRemote, window, Switch: primitives.Switch, versions: { STUDIO_VERSION, STUDIO_PLUGIN_VERSION, DSH_VERSION } });
 
 
   return {
