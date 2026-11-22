@@ -47,7 +47,7 @@ test('Delivery hydrates the preferred Agent, consumes focus and scrolls the requ
   let stored = JSON.stringify(focus), scrolled = 0;
   const window = { localStorage: { getItem: () => stored, removeItem: () => { stored = null; } } };
   const ui = harness('DeliveryPage', { focus }, window);
-  ui.api.agents = async () => ({ items: [{ metadata: { id: 'a' } }, { metadata: { id: 'b' } }] });
+  ui.api.agents = async () => ({ items: [{ metadata: { id: 'a' } }] });
   const hydrated = [], selectors = [], classes = new Set();
   ui.api.agent = async id => { hydrated.push(id); return { metadata: { id }, builds: [] }; };
   ui.nodes().find(node => node.props['data-studio-delivery']).props.ref.current = { querySelector: selector => { selectors.push(selector); return { scrollIntoView: () => { scrolled++; }, classList: { add: value => classes.add(value), remove: value => classes.delete(value) } }; } };
@@ -64,19 +64,33 @@ test('Delivery hydrates the preferred Agent, consumes focus and scrolls the requ
   assert.equal(selectors.at(-1), '[data-delivery-section="build"]');
 });
 
-test('Delivery handles an empty preferred catalog and retains focus when loading fails', async () => {
+test('Delivery retains an unavailable explicit target and never substitutes a different Agent', async () => {
   const focus = { tab: 'delivery', agentId: 'missing', section: 'build' };
   let stored = JSON.stringify(focus);
   const window = { localStorage: { getItem: () => stored, removeItem: () => { stored = null; } } };
   const ui = harness('DeliveryPage', { focus }, window);
+  ui.api.agents = async () => ({ items: [{ metadata: { id: 'other' } }] });
+  const attempted = [];
+  ui.api.agent = async id => { attempted.push(id); return { metadata: { id: 'other' } }; };
   await ui.settle();
-  assert.equal(ui.field('目标 Agent').props.value, '');
-  assert.equal(stored, null);
-  stored = JSON.stringify(focus);
+  assert.equal(ui.field('目标 Agent'), undefined);
+  assert.ok(ui.nodes().some(node => node.props.title === '交付状态不可用' && node.props.detail.includes('missing')));
+  assert.notEqual(stored, null);
+  await ui.button('重新读取').props.onClick(); await ui.settle();
+  assert.deepEqual(attempted, ['missing', 'missing']);
   ui.api.agents = async () => { throw Error('catalog offline'); };
   await ui.props({ focus: { ...focus } });
   assert.notEqual(stored, null);
   assert.ok(ui.nodes().some(node => node.props.title === '交付状态不可用' && node.props.detail === 'catalog offline'));
+});
+
+test('Delivery keeps the deployment selected on the Cloud Agent card', async () => {
+  const ui = harness('CloudDeploymentPanel', { agentId: 'a', deploymentId: 'older', selectedBuild: 'build-new' });
+  for (const [id, createdAt] of [['older', '2026-01-01'], ['latest', '2026-01-02']]) {
+    ui.rows.push({ id, agentId: 'a', cloudAgentId: `ar-${id}`, state: 'READY', createdAt });
+  }
+  await ui.settle();
+  assert.equal(ui.field('部署目标').props.value, 'older');
 });
 
 test('paired specifications default to 2 cores / 4 GB and checking never submits a create', async () => {
@@ -285,4 +299,51 @@ test('deployment failure remains a one-line alert without changing retry availab
   assert.ok(ui.nodes().some(node => node.props.role === 'alert' && node.props.title === 'quota unavailable'));
   assert.equal(ui.button('检查部署').props.disabled, false);
   assert.equal(ui.field('部署检查结果'), undefined);
+});
+
+test('Delivery embedded in an Agent locks the target, drops the picker and scopes records to that Agent', async () => {
+  const ui = harness('DeliveryPage', { agentId: 'b', focus: { agentId: 'b', section: 'build' } });
+  ui.api.agents = async () => ({ items: [{ metadata: { id: 'a' } }, { metadata: { id: 'b', local: true } }] });
+  const hydrated = [];
+  ui.api.agent = async id => { hydrated.push(id); return { metadata: { id, local: true }, builds: [] }; };
+  ui.rows.push({ id: 'dep-other', agentId: 'a', agentName: 'Other', cloudAgentId: 'cloud-a', state: 'FAILED', failure: { code: 'X', message: 'failed' }, createdAt: '2026-01-01' });
+  await ui.settle();
+  assert.deepEqual(hydrated, ['b']);
+  assert.equal(ui.field('目标 Agent'), undefined);
+  assert.equal(ui.nodes().find(node => node.props['data-studio-delivery']).props['data-embedded'], 'true');
+  assert.equal(ui.nodes().some(node => node.type === 'StudioPageTabs'), false);
+  assert.equal(ui.nodes().some(node => ui.text(node).includes('其他 Agent 有')), false);
+  assert.equal(ui.field('显示已删除的部署记录'), undefined);
+  assert.ok(ui.button('构建当前版本'));
+});
+
+test('each step shows its state, edits in a field grid, states fixed values and keeps the checked plan inside the deploy step', async () => {
+  const page = harness('DeliveryPage', { agentId: 'a' });
+  page.api.agents = async () => ({ items: [{ metadata: { id: 'a', revision: 2, local: true } }] });
+  page.api.agent = async () => ({ metadata: { id: 'a', revision: 2, local: true }, builds: [{ id: 'old', revision: 1, status: 'SUCCEEDED' }] });
+  await page.settle();
+  const build = page.nodes().find(node => node.props['data-delivery-section'] === 'build');
+  assert.ok(build.children.flatMap(child => child.children || []).some(node => node.props?.className === 'af-section-side' && page.text(node) === '需要重新构建'));
+  const headline = page.nodes().find(node => node.props.className === 'ad-headline');
+  assert.match(page.text(headline), /配置已更新到 r2.*重新构建后.*构建当前版本/);
+  assert.deepEqual(headline.children[1].children, [page.field('构建版本'), page.button('构建当前版本')]);
+  assert.equal(page.nodes().some(node => typeof node.props.className === 'string' && node.props.className.includes('af-row')), false);
+
+  const ui = harness();
+  ui.rows.push({ id: 'live', agentId: 'a', agentName: 'Live', state: 'READY', cloudAgentId: 'cloud-a', buildId: 'old', resources: { cpu: 2, memoryGiB: 4 } });
+  ui.api.prepareDeploymentUpdate = async request => ({ ...preview({ resources: {} }), deploymentId: request.deploymentId });
+  await ui.settle();
+  const deploy = () => ui.nodes().find(node => node.props['data-delivery-section'] === 'deploy');
+  const within = (root, node) => root === node || (root?.children || []).some(child => within(child, node));
+  assert.ok(ui.nodes().some(node => node.props.className === 'studio-st' && node.props['data-tone'] === 'ok' && ui.text(node) === '已部署'));
+  const fields = ui.nodes().find(node => node.props.className === 'ad-fields');
+  assert.ok(within(fields, ui.field('部署目标')) && within(fields, ui.field('使用推荐运行镜像')));
+  const facts = ui.nodes().find(node => node.type === 'dl' && node.props.className === 'ad-facts');
+  assert.match(ui.text(facts), /实例规格2 核 \/ 4 GB.*对话存储20 GiB 持久化云盘挂载 \/home\/node · 按天计费/);
+  assert.equal(within(deploy(), ui.field('部署检查结果')), false);
+  await ui.button('检查更新').props.onClick(); await ui.settle();
+  assert.ok(within(deploy(), ui.field('部署检查结果')), 'the checked plan belongs to the deploy step');
+  const empty = harness(); await empty.settle();
+  assert.ok(empty.nodes().some(node => node.props.className === 'af-note ad-empty' && /尚未部署/.test(empty.text(node))));
+  assert.ok(empty.nodes().some(node => node.props.className === 'studio-st' && node.props['data-tone'] === 'neutral' && empty.text(node) === '未部署'));
 });

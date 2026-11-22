@@ -129,6 +129,15 @@ export default String.raw`
 .ak-segmented > button:focus-visible, .ak-agents-toolbar .af-btn:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, var(--dsw-alias-brand-primary)); outline-offset: 1px; }
 .ak-agents-notice { margin: 0 0 12px; padding: 10px 12px; border-radius: var(--dsw-radius-md,12px); background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); font-size: 13px; line-height: 20px; }
 .ak-agents-list { min-width: 0; }
+.ak-agents-notice { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+/* Agent detail: one identity header, then configuration and delivery as tabs of the same Agent. */
+[data-studio-agent-detail] { min-width: 0; }
+[data-studio-agent-detail] > .af-back { margin-bottom: 16px; padding-left: 0; }
+.ak-detail-head { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
+.ak-detail-head .studio-row-title strong { font-size: 20px; line-height: 28px; font-weight: 500; }
+[data-studio-agent-detail] > .studio-tabs { margin-bottom: 24px; }
+[data-studio-agent-detail] [data-agent-panel][hidden] { display: none; }
+[data-studio-agent-detail] [data-studio-delivery] { margin-inline: 0; }
 .ak-agents-list-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 0 0 16px; }
 .ak-agents-list-head > strong { font-size: 14px; font-weight: 500; color: var(--dsw-alias-label-primary); }
 .ak-agent-card { display: flex; align-items: center; gap: 14px; min-width: 0; margin: 0 -8px; padding: 8px; border: 0; border-radius: var(--dsw-radius-xl,16px); cursor: pointer; }

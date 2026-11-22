@@ -2,12 +2,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, writeFile, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { HARNESS_SERVICE_PRESET_SUFFIX } from './agent-preset-admission.mjs';
 import { OFFICIAL_TEAM_TOOL_MODULE, usesOfficialTeamTools } from './studio-team-runtime.mjs';
 import { installStudioTeamTools, studioTeammateRequest } from './studio-team-tools.mjs';
+import { isTeamRuntimeType } from './runtime-contract.mjs';
 
 const fail = (code, message) => Object.assign(new Error(message), { code });
 const copy = value => structuredClone(value);
-const nativeRuntimes = new Set(['dsh-native', 'harness']);
 
 function text(value, label, max) {
   const result = String(value || '').trim();
@@ -190,7 +191,7 @@ export function createStudioTeams({ ctx, directory, agents, getAdmission, runtim
     }
     const spec = copy(role.spec || source.spec || {});
     const runtime = String(spec.runtime?.type || '').trim();
-    if (!nativeRuntimes.has(runtime)) throw fail('TEAM_AGENT_UNSUPPORTED', '专家团成员必须使用本机 DSH Native 或 Harness');
+    if (!isTeamRuntimeType(runtime)) throw fail('TEAM_AGENT_UNSUPPORTED', '专家团成员必须使用本机 DSH Native 或 Harness');
     if (role.bindings && typeof role.bindings === 'object') {
       spec.bindings = { ...(spec.bindings || {}), ...copy(role.bindings) };
       if (role.bindings.modelId) {
@@ -247,6 +248,7 @@ export function createStudioTeams({ ctx, directory, agents, getAdmission, runtim
       agent,
       allowUnavailableResources: recovery,
       requireModelSelection,
+      ...(role.agentPreset ? { requestedPresetId: role.agentPreset } : {}),
     });
     if (admission?.presetId) {
       if (role.agentPreset && role.agentPreset !== admission.presetId) {
@@ -258,7 +260,9 @@ export function createStudioTeams({ ctx, directory, agents, getAdmission, runtim
     return admission;
   }
   async function admitRoles(run, recovery = false) {
-    for (const role of run.roles || []) await admitRole(run, role, recovery);
+    const admissions = [];
+    for (const role of run.roles || []) admissions.push(await admitRole(run, role, recovery));
+    return admissions;
   }
   async function mount(agent) {
     const parent = agent.session?.header?.parentSession;
@@ -287,14 +291,13 @@ export function createStudioTeams({ ctx, directory, agents, getAdmission, runtim
     // cannot be rejected by the local runtime's binding check.
     const admission = await admitRole(run, role, true, Boolean(parent));
     const registry = ctx.get('agentPresets');
-    if (registry.composedPreset(agent.ctx) !== admission.presetId) await registry.recompose(agent.ctx, admission.presetId);
-    if (parent && admission.modelSelection) {
-      agent.ctx.on('agent/request', async (_payload, next) => ({ ...await next(), ...admission.modelSelection }), { prepend: true });
-      agent.ctx.on('system-prompt/assemble', async (_payload, _context, next) => {
-        const value = await next();
-        return { ...value, variables: { ...value.variables, ...admission.modelSelection } };
-      });
+    if (registry.composedPreset(agent.ctx) !== admission.presetId) {
+      const boundary = parent && ctx.get('agents')?.turnBoundaryOf?.(agent.session);
+      if (boundary?.lastTurn === 0 && boundary.openTurnStartSeq === null && typeof registry.select === 'function')
+        await registry.select(agent, admission.presetId);
+      else await registry.recompose(agent.ctx, admission.presetId);
     }
+    if (parent && admission.modelSelection) agent.model.select(admission.modelSelection);
     mountTools(agent, { teams, run, useOfficialTools });
     if (!parent && run.instructions) {
       if (initializing) {
@@ -376,7 +379,7 @@ export function createStudioTeams({ ctx, directory, agents, getAdmission, runtim
       const items = (await all('definitions')).filter(Boolean).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
       const choices = (await agents.list()).filter(agent => !agent.metadata?.teamRole).map(agent => ({
         ...agent,
-        selectable: agent.metadata?.local === true && nativeRuntimes.has(agent.spec?.runtime?.type),
+        selectable: agent.metadata?.local === true && isTeamRuntimeType(agent.spec?.runtime?.type),
       }));
       return { items, presets: [], agents: choices };
     },
@@ -390,7 +393,7 @@ export function createStudioTeams({ ctx, directory, agents, getAdmission, runtim
         for (const role of [value.lead, ...value.members]) {
           if (role.source.kind === 'agent') {
             const source = await agents.get(role.source.agentId);
-            if (!source || source.metadata?.local !== true || !nativeRuntimes.has(source.spec?.runtime?.type)) {
+            if (!source || source.metadata?.local !== true || !isTeamRuntimeType(source.spec?.runtime?.type)) {
               throw fail('TEAM_AGENT_UNSUPPORTED', '请选用本机 DSH Native 或 Harness 专家；云端与 Codex 成员尚未接入');
             }
           }
@@ -455,17 +458,19 @@ export function createStudioTeams({ ctx, directory, agents, getAdmission, runtim
           }),
         };
         await hydrate(run);
-        await admitRoles(run);
+        const admissions = await admitRoles(run);
         runs.set(run.id, run);
         const lead = run.roles[0];
-        const leadAdmission = await admitRole(run, lead);
+        const leadAdmission = admissions[0];
+        const workspaceRoot = admissions.find(admission => admission?.workspaceRoot)?.workspaceRoot;
         lead.agentPreset ||= leadAdmission.presetId;
         run.dshRootSessionId = run.id;
         await write('runs', run);
         const initializing = { spawning: true, teammates: new Set() };
         startup.set(run.id, initializing);
         try {
-          await controller.create({ sessionId: run.id, agentPreset: leadAdmission.presetId });
+          await controller.create({ sessionId: run.id, agentPreset: leadAdmission.presetId,
+            ...(workspaceRoot ? { cwd: workspaceRoot } : {}) });
           await controller.rename?.({ sessionId: run.id, title: team.name });
           if (leadAdmission.modelSelection) await controller.selectModel({ sessionId: run.id, ...leadAdmission.modelSelection, saveDefault: false });
           const resolved = await controller.resolveAgent(run.id);
@@ -530,6 +535,11 @@ export function createStudioTeams({ ctx, directory, agents, getAdmission, runtim
       const members = root ? teams.listMembers(root).map(copy) : (teamProjection?.members || []).map(member => ({
         ...member, status: member.phase === 'active' ? 'inactive' : member.phase,
       }));
+      const rolesByName = new Map((run.roles || []).map(role => [role.name, role]));
+      for (const member of members) {
+        const role = rolesByName.get(member.name);
+        if (role?.model && role.agentPreset?.endsWith(HARNESS_SERVICE_PRESET_SUFFIX)) member.model = role.model;
+      }
       await Promise.all(members.filter(member => member.role === 'teammate' && member.status === 'inactive').map(async member => {
         const memberEnd = (await sessionEvents(childSessionId(member))).findLast(event => event.type === 'turn/end')?.data?.reason;
         if (memberEnd?.kind === 'error') member.lastError = {

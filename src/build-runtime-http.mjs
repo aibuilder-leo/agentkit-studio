@@ -5,6 +5,9 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { createRuntimeResponsesContract } from './runtime-responses-contract.mjs';
 import { createRuntimeResponsesStream } from './runtime-responses-stream.mjs';
 import { redactDiagnosticText } from '@kingsoftcloud/agentkit-harness-core/error-presentation';
+import { HOSTED_HARNESS_VIEW_PATH } from './harness-view-presentation.mjs';
+import { ENGINE_VIEW_HEADERS } from './host/routes/native-engine-view.mjs';
+import { bindBusinessInvocation, runWithBusinessInvocation } from './providers/business-invocation-context.mjs';
 
 const hash = value => createHash('sha256').update(value).digest();
 const identity = value => /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value);
@@ -52,7 +55,7 @@ function readRequestedExecutionMode(value) {
   return mode;
 }
 
-export async function startBuildRuntimeHttp({ agentId, buildId, managedIdentity, platformActions, withResourceContext, bundleSha256 = '', deploymentVersion = 'initial', token, runner, executionPolicy, executionPolicyMax, validatePrevious, hosted, approval, responseProjection, model = '', models = [model], host = '127.0.0.1', port = 8080, maxActive = 16, observability, runLog = entry => console.info(JSON.stringify(entry)) } = {}) {
+export async function startBuildRuntimeHttp({ agentId, buildId, managedIdentity, platformActions, withResourceContext, bundleSha256 = '', deploymentVersion = 'initial', token, runner, executionPolicy, executionPolicyMax, validatePrevious, hosted, approval, responseProjection, harnessView, allowImages = false, model = '', models = [model], host = '127.0.0.1', port = 8080, maxActive = 16, observability, runLog = entry => console.info(JSON.stringify(entry)) } = {}) {
   const managed = !buildId && managedIdentity?.agentId === agentId && identity(managedIdentity?.versionId || '') && /^[a-f0-9]{64}$/.test(managedIdentity?.manifestSha256 || '');
   if (!agentId || (managedIdentity ? !managed : !/^build_[0-9a-f]{20}$/.test(buildId || '')) || String(token || '').length < 24 || typeof runner !== 'function') throw fail('RUNTIME_CONFIG_INVALID');
   const declaredPolicy = readExecutionPolicy(executionPolicy);
@@ -60,7 +63,7 @@ export async function startBuildRuntimeHttp({ agentId, buildId, managedIdentity,
   const allowedPermissionModes = executionModesUpTo(ceiling);
   const scope = managed ? JSON.stringify([managedIdentity.versionId, managedIdentity.manifestSha256]) : buildId;
   const tokenHash = hash(token);
-  const responses = createRuntimeResponsesContract({ agentId, buildId, definitionId: managedIdentity?.manifestSha256, versionId: managedIdentity?.versionId, token, model, models });
+  const responses = createRuntimeResponsesContract({ agentId, buildId, definitionId: managedIdentity?.manifestSha256, versionId: managedIdentity?.versionId, token, model, models, allowImages });
   const active = new Map();
   platformActions?.setRunControl({ cancelRun: (runId, sessionId, principalDigest) => {
     const target = active.get(runId);
@@ -97,10 +100,22 @@ export async function startBuildRuntimeHttp({ agentId, buildId, managedIdentity,
       if (req.method === 'GET' && url.pathname === '/v1/agentkit/runtime') {
         const owner = managed ? { format: 'agentengine.managed-runtime/v1', ...managedIdentity }
           : { format: 'agentkit.runtime-identity/v1', agentId, buildId, bundleSha256, deploymentVersion };
-        json(res, 200, { ...owner, status: 'ready', model, models, ...(declaredPolicy ? { executionPolicy: declaredPolicy } : {}), ...(declaredPolicy && allowedPermissionModes.length ? { allowedPermissionModes } : {}), capabilities: ['bound-model-selection', 'resource-checks', ...(declaredPolicy && allowedPermissionModes.length ? [CLOUD_EXECUTION_POLICY_CAPABILITY] : [])] }); return;
+        json(res, 200, { ...owner, status: 'ready', model, models, ...(declaredPolicy ? { executionPolicy: declaredPolicy } : {}), ...(declaredPolicy && allowedPermissionModes.length ? { allowedPermissionModes } : {}), capabilities: ['bound-model-selection', 'resource-checks', ...(harnessView ? ['harness-task-view'] : []), ...(declaredPolicy && allowedPermissionModes.length ? [CLOUD_EXECUTION_POLICY_CAPABILITY] : [])] }); return;
       }
       if (managed && (req.headers['x-agentengine-target-version-id'] !== managedIdentity.versionId
         || req.headers['x-agentengine-manifest-sha256'] !== managedIdentity.manifestSha256)) throw fail('RUNTIME_DEPLOYMENT_CHANGED', 409);
+      if (harnessView && ['GET', 'HEAD'].includes(req.method)
+        && url.pathname.startsWith(HOSTED_HARNESS_VIEW_PATH + '/')) {
+        const sha256 = url.pathname.slice(HOSTED_HARNESS_VIEW_PATH.length + 1);
+        if (!/^[a-f0-9]{64}$/.test(sha256)) throw fail('RUNTIME_HARNESS_VIEW_NOT_FOUND', 404);
+        let html;
+        try { html = await harnessView(sha256); }
+        catch { throw fail('RUNTIME_HARNESS_VIEW_UNAVAILABLE', 502); }
+        if (html === null) throw fail('RUNTIME_HARNESS_VIEW_NOT_FOUND', 404);
+        res.writeHead(200, ENGINE_VIEW_HEADERS);
+        res.end(req.method === 'HEAD' ? undefined : html);
+        return;
+      }
       const cancel = /^\/runs\/(run_[0-9a-f]{32})\/cancel$/.exec(url.pathname);
       const cancelResponse = /^\/v1\/responses\/([^/]+)\/cancel$/.exec(url.pathname);
       if (req.method === 'POST' && (cancel || cancelResponse)) {
@@ -121,9 +136,10 @@ export async function startBuildRuntimeHttp({ agentId, buildId, managedIdentity,
       if (isResponses && req.headers['last-event-id']) throw fail('RESPONSES_STREAM_REPLAY_UNSUPPORTED');
       if (!String(req.headers['content-type'] || '').startsWith('application/json')) throw fail('RUNTIME_JSON_REQUIRED', 415);
       const chunks = []; let bytes = 0;
+      const bodyLimit = allowImages && isResponses ? 8 * 1024 * 1024 : 256 * 1024;
       for await (const chunk of req.iterator({ destroyOnReturn: false })) {
         bytes += chunk.length;
-        if (bytes > 256 * 1024) { req.resume(); throw fail('RUNTIME_INPUT_TOO_LARGE', 413); }
+        if (bytes > bodyLimit) { req.resume(); throw fail('RUNTIME_INPUT_TOO_LARGE', 413); }
         chunks.push(chunk);
       }
       try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw fail('RUNTIME_INVALID_JSON'); }
@@ -149,7 +165,7 @@ export async function startBuildRuntimeHttp({ agentId, buildId, managedIdentity,
         || (input.stream !== undefined && typeof input.stream !== 'boolean'))) throw fail('RUNTIME_INPUT_INVALID');
       if (isResponses) {
         if (isHostedRun) input = await hosted.responsesInput(input, req.headers);
-        else if (platformActions) input = await platformActions.parseResponses(input, req.headers, responses, AbortSignal.timeout(30000));
+        else if (platformActions) input = await platformActions.parseResponses(input, req.headers, responses, AbortSignal.timeout(30000), { runAgent: action === 'RunAgent' });
         else input = responses.parse(input, req.headers);
       }
       if (input.hosted && hosted) await hosted.prepareRun(input);
@@ -239,12 +255,31 @@ export async function startBuildRuntimeHttp({ agentId, buildId, managedIdentity,
         heartbeat = setInterval(() => { if (!res.destroyed && !abort.signal.aborted) res.write(': keepalive\n\n'); }, 15000); heartbeat.unref();
       }
       const invoke = () => runner({ agentId, buildId, sessionId, occurrenceId: runId, input: input.input,
+        ...(input.images?.length ? { images: input.images } : {}),
+        ...(input.businessInvocation ? { businessInvocation: input.businessInvocation } : {}),
         ...(savedResponse ? { requireReplay: true } : {}), ...(isResponses ? { model: input.model } : {}),
         ...(approvalRun ? { approvalPolicy: approvalRun.policy } : {}),
         signal: abort.signal,
         ...(requestedMode || declaredPolicy?.permissionMode ? { permissionMode: requestedMode || declaredPolicy.permissionMode } : {}),
         ...(input.stream || projection ? { onFrame: frame => { if (!abort.signal.aborted && !savedResponse) { if (projection) projection.frame(frame); else emit(frame.kind === 'assistant' ? 'dsh.assistant' : 'dsh.event', frame.value); } } } : {}) });
-      const result = withResourceContext ? await withResourceContext({ headers: req.headers, subjectDigest: input.principalDigest, signal: abort.signal }, invoke) : await invoke();
+      // Business caller identity is a private Runtime context. It is not part
+      // of the DSH prompt, persisted user message, model options, or response
+      // body; only the MCP boundary reads it while this RunAgent is executing.
+      const invokeWithBusinessIdentity = () => runWithBusinessInvocation(input.businessInvocation, invoke);
+      // The independent engine calls back for MCP tools over its own HTTP
+      // request, which does not inherit this async context. Bind the turn's
+      // business identity to its Session for exactly the duration of the run.
+      const releaseBusinessBinding = bindBusinessInvocation(sessionId, input.businessInvocation);
+      let result;
+      try {
+        result = withResourceContext
+          ? await withResourceContext({ headers: req.headers, subjectDigest: input.principalDigest, signal: abort.signal }, invokeWithBusinessIdentity)
+          : await invokeWithBusinessIdentity();
+      } finally {
+        // The engine may fail or be cancelled before the runner resolves. The
+        // Session registry must never outlive this turn in either case.
+        releaseBusinessBinding();
+      }
       if (abort.signal.aborted) throw abort.signal.reason;
       await platformActions?.flushRun(input);
       abort.signal.throwIfAborted();

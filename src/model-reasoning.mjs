@@ -32,22 +32,33 @@
  * other module invents a wire value.
  */
 export const REASONING_PROFILES = Object.freeze({
+  // 星流 serves the whole DSH level range on both wires — `low` through `max`
+  // answer 200 on kimi-k3, kimi-k3.1-pro, deepseek-v4.1-flash and glm-5.3 —
+  // so the selector offers the five levels an operator can tell apart. The
+  // historical low/high/max row was a guess that dropped `medium` and `xhigh`
+  // for no reason; see `scripts/verify-model-wire.mjs` for how the gateway is
+  // asked rather than assumed.
+  //
+  // `minimal` stays out: it is the "thinking off" spelling, and gateways
+  // disagree about it — glm-5.3 refuses it outright ("不支持关闭思考模式") while
+  // kimi-k3.1-pro accepts it on Chat and refuses it on Responses. A level the
+  // product cannot promise belongs behind a probe, not in the default row.
   ksyun: Object.freeze({
     provider: 'ksyun',
-    levels: Object.freeze(['low', 'high', 'max']),
-    wire: Object.freeze({ low: 'low', high: 'high', max: 'max' }),
+    levels: Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']),
+    wire: Object.freeze({ low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' }),
     default: 'high',
   }),
   deepseek: Object.freeze({
     provider: 'deepseek',
-    levels: Object.freeze(['low', 'high', 'max']),
-    wire: Object.freeze({ low: 'low', high: 'high', max: 'max' }),
+    levels: Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']),
+    wire: Object.freeze({ low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' }),
     default: 'high',
   }),
   openai: Object.freeze({
     provider: 'openai',
     levels: Object.freeze(['low', 'medium', 'high']),
-    // OpenAI accepts minimal/low/medium/high; `max` is not part of the enum.
+    // Legacy profiles use these presets. Explicit model ranges can be wider.
     wire: Object.freeze({ low: 'low', medium: 'medium', high: 'high' }),
     default: 'medium',
   }),
@@ -76,7 +87,7 @@ export const REASONING_FALLBACK_PROFILE = Object.freeze({
 });
 
 /** Every level a Studio declaration may expose, in canonical order. */
-export const STUDIO_REASONING_LEVELS = Object.freeze(['low', 'medium', 'high', 'max']);
+export const STUDIO_REASONING_LEVELS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']);
 
 /** Legacy alias for the DeepSeek-style wire map, kept for importers. */
 export const STUDIO_REASONING_WIRE = REASONING_PROFILES.ksyun.wire;
@@ -98,6 +109,11 @@ export function reasoningProfileFor(provider) {
   return Object.hasOwn(REASONING_PROFILES, key) ? REASONING_PROFILES[key] : REASONING_FALLBACK_PROFILE;
 }
 
+export function reasoningLevelsFor(profile) {
+  const { levels } = reasoningProfileFor(profile?.provider);
+  return Array.isArray(profile?.reasoningLevels) ? STUDIO_REASONING_LEVELS.filter(level => profile.reasoningLevels.includes(level)) : levels;
+}
+
 /**
  * Resolve the reasoning declaration a profile publishes.
  * @param {object} profile - a Studio model profile.
@@ -112,8 +128,10 @@ export function studioReasoning(profile = {}) {
   // `true` is the persisted opt-in marker: the provider table supplies both
   // the selector levels and the wire map. An explicit object is a
   // caller-declared override and stays authoritative, in canonical order.
-  const levels = declared === true ? capability.levels : STUDIO_REASONING_LEVELS;
-  const source = declared === true ? capability.wire : declared;
+  const levels = declared === true ? reasoningLevelsFor(profile) : STUDIO_REASONING_LEVELS;
+  const source = declared === true
+    ? Object.fromEntries(levels.map(level => [level, capability.wire[level] ?? level]))
+    : declared;
   if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
   const efforts = Object.fromEntries(levels
     .filter(level => typeof source[level] === 'string' && source[level].trim())
@@ -124,6 +142,13 @@ export function studioReasoning(profile = {}) {
   const wanted = String(profile?.defaultReasoningEffort || '');
   const fallback = efforts[capability.default] ? capability.default : Object.keys(efforts)[0];
   return { efforts, defaultEffort: efforts[wanted] ? wanted : fallback };
+}
+
+/** Persist the declared subset and default while keeping wire names in the provider table. */
+export function modelReasoningConfig(profile) {
+  const fields = Array.isArray(profile.reasoningLevels) ? { reasoningLevels: reasoningLevelsFor(profile) } : {};
+  const reasoning = profile.reasoningEfforts && studioReasoning({ ...profile, reasoningEfforts: true });
+  return reasoning ? { ...fields, reasoningEfforts: true, defaultReasoningEffort: reasoning.defaultEffort } : fields;
 }
 
 /**
@@ -156,8 +181,8 @@ export function studioCodexReasoningWire(level) {
  */
 export function studioReasoningFallbackWire(profile) {
   const capability = reasoningProfileFor(profile?.provider);
-  const level = capability.levels[capability.levels.length - 1];
-  return capability.wire[level];
+  const level = reasoningLevelsFor(profile).at(-1);
+  return capability.wire[level] ?? level;
 }
 
 /**
@@ -215,6 +240,182 @@ export function normalizeReasoningContent(body) {
     return reasoning;
   });
   return normalized;
+}
+
+/**
+ * Drop assistant turns that carry neither text nor tool calls.
+ *
+ * Every OpenAI-compatible gateway validates an assistant turn as
+ * `content`-or-`tool_calls` and answers
+ * `400 Invalid assistant message: content or tool_calls must be set` when both
+ * are empty. The shape is reachable because history is built elsewhere: DSH's
+ * Responses projection emits `{ role: 'assistant', content: [] }` for a session
+ * turn whose text is gone (a turn that only ever carried reasoning, or one
+ * truncated by compaction), and the Responses-to-Chat conversion normalizes
+ * every empty form to `content: ''`. Such a turn carries no information, so it
+ * is never worth forwarding — and unlike a replayed reasoning item it loses
+ * nothing when dropped. Drop it before the request leaves the proxy instead of
+ * spending a round-trip to learn what the gateway will say.
+ *
+ * @param {object} body - the serialized request body to mutate.
+ * @returns {number} how many assistant turns were dropped.
+ */
+export function normalizeEmptyAssistantTurns(body) {
+  if (!body || typeof body !== 'object') return 0;
+  const emptyContent = content => content == null
+    || (typeof content === 'string' && !content.trim())
+    || (Array.isArray(content) && !content.length);
+  // Both wires are handled: Chat Completions rows carry `tool_calls`, Responses
+  // message items carry no calls at all (the calls are separate items), which is
+  // exactly why an assistant row with no content is always droppable.
+  const emptyTurn = turn => emptyContent(turn.content)
+    && !(Array.isArray(turn.tool_calls) && turn.tool_calls.length)
+    && !(Array.isArray(turn.toolCalls) && turn.toolCalls.length);
+  let dropped = 0;
+  const keep = turn => {
+    if (!turn || typeof turn !== 'object' || turn.role !== 'assistant') return true;
+    // Only message items are turns; a reasoning item is not one and keeps its
+    // (possibly empty) content.
+    if (turn.type !== undefined && turn.type !== 'message') return true;
+    if (!emptyTurn(turn)) return true;
+    dropped += 1;
+    return false;
+  };
+  if (Array.isArray(body.input)) body.input = body.input.filter(keep);
+  if (Array.isArray(body.messages)) body.messages = body.messages.filter(keep);
+  return dropped;
+}
+
+/**
+ * Drop replayed reasoning items that belong to a turn carrying nothing else.
+ *
+ * The Responses wire groups one assistant turn as a run of `reasoning` items
+ * followed by `message` items, and a gateway that validates the turn (magpie →
+ * 星流 prefill) accepts it only when the turn also carries an assistant
+ * `message` with non-null content or a `function_call`. A turn made only of
+ * reasoning is answered with
+ * `400 Invalid assistant message: content or tool_calls must be set`, and
+ * stripping the reasoning item's `content` field — the earlier repair — re-sends
+ * a body the gateway refuses identically. Such a turn replays thinking behind a
+ * response that produced no text and no tool call, so it is worth nothing:
+ * drop its reasoning items.
+ *
+ * Turns that do carry text or a call keep their reasoning items untouched, so
+ * reasoning continuity for tool flows (which OpenAI documents) is preserved.
+ *
+ * @param {object} body - the serialized request body to mutate.
+ * @returns {number} how many reasoning items were dropped.
+ */
+export function dropCarrierlessReasoningTurns(body) {
+  if (!body || !Array.isArray(body.input)) return 0;
+  const items = body.input;
+  const emptyContent = content => content == null
+    || (typeof content === 'string' && !content.trim())
+    || (Array.isArray(content) && !content.length);
+  const drop = new Set();
+  let reasoning = [];
+  let carries = false;
+  // A turn ends where the wire starts a new one: a user/system/developer
+  // message, a tool receipt, or the end of input. `function_call` items belong
+  // to the turn they follow and count as its carrier.
+  const flush = () => {
+    if (!carries) for (const index of reasoning) drop.add(index);
+    reasoning = [];
+    carries = false;
+  };
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (!item || typeof item !== 'object') continue;
+    const type = item.type;
+    if (type === 'reasoning') { reasoning.push(index); continue; }
+    if (type === 'function_call' || type === 'custom_tool_call') { carries = true; continue; }
+    if (type === 'function_call_output' || type === 'custom_tool_call_output') { flush(); continue; }
+    if (type === 'message' || type === undefined) {
+      if (item.role === 'assistant') {
+        // Parallel tool calls on a message item are carriers just like the
+        // separate `function_call` items of the same turn.
+        if ((Array.isArray(item.tool_calls) && item.tool_calls.length)
+          || (Array.isArray(item.toolCalls) && item.toolCalls.length)
+          || !emptyContent(item.content)) carries = true;
+        continue;
+      }
+      flush();
+      continue;
+    }
+    // An item this projection does not know is treated as its own boundary.
+    flush();
+  }
+  flush();
+  if (!drop.size) return 0;
+  body.input = items.filter((_, index) => !drop.has(index));
+  return drop.size;
+}
+
+/**
+ * Drop tool receipts whose assistant call is no longer in the request.
+ *
+ * A receipt is only meaningful as the answer to a `function_call`. History
+ * built upstream of this proxy can lose the call while keeping the receipt
+ * (compaction that keeps a tool result but drops the assistant turn, or a
+ * truncated replay), and every OpenAI-compatible gateway then refuses the whole
+ * request: `400 Messages with role 'tool' must be a response to a preceding
+ * message with 'tool_calls'`. The model cannot interpret a receipt on its own,
+ * so drop the orphan instead of forwarding a request no gateway accepts.
+ *
+ * Receipts are paired in order — one receipt answers one call — which mirrors
+ * the pairing the Responses projection itself enforces.
+ *
+ * @param {object} body - the serialized request body to mutate.
+ * @returns {number} how many receipts were dropped.
+ */
+export function dropOrphanToolReceipts(body) {
+  if (!body || typeof body !== 'object') return 0;
+  const receipt = (pending, callId) => {
+    const id = String(callId ?? '');
+    if (!id || !pending.has(id)) return false;
+    pending.delete(id);
+    return true;
+  };
+  let dropped = 0;
+  if (Array.isArray(body.input)) {
+    const pending = new Set();
+    body.input = body.input.filter(item => {
+      const type = item?.type;
+      if (type === 'function_call' || type === 'custom_tool_call') {
+        const id = String(item.call_id ?? '');
+        if (id) pending.add(id);
+        return true;
+      }
+      if (type === 'function_call_output' || type === 'custom_tool_call_output') {
+        if (receipt(pending, item.call_id)) return true;
+        dropped += 1;
+        return false;
+      }
+      return true;
+    });
+  }
+  if (Array.isArray(body.messages)) {
+    // Chat Completions keeps the calls inside the assistant row, so the pairing
+    // has to be tracked per row rather than per item.
+    const pending = new Set();
+    body.messages = body.messages.filter(message => {
+      if (!message || typeof message !== 'object') return true;
+      if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+        for (const call of message.tool_calls) {
+          const id = String(call?.id ?? '');
+          if (id) pending.add(id);
+        }
+        return true;
+      }
+      if (message.role === 'tool') {
+        if (receipt(pending, message.tool_call_id)) return true;
+        dropped += 1;
+        return false;
+      }
+      return true;
+    });
+  }
+  return dropped;
 }
 
 /**

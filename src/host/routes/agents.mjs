@@ -101,6 +101,7 @@ export function createAgentRoutes({ agentStorePromise, agentCatalogPromise, stud
             return { ok: true, value: { agentId, buildId: connection.agent.deployment.buildId,
                 executionPolicy: connection.executionPolicy || null,
                 allowedPermissionModes: connection.allowedPermissionModes || [],
+                ...(connection.defaultPermissionMode ? { defaultPermissionMode: connection.defaultPermissionMode } : {}),
                 executionModeSwitching: connection.executionModeSwitching === true,
                 selectedPermissionMode: cloudExecutionModes ? await cloudExecutionModes.get(agentId) : null } };
         }
@@ -129,10 +130,9 @@ export function createAgentRoutes({ agentStorePromise, agentCatalogPromise, stud
                 const local = await localStore.get(agentId);
                 const buildId = String(payload?.buildId || '').trim();
                 const build = buildId ? await (await studioBuildPromise).build.resolve(agentId, buildId) : null;
-                // The no-build path remains the original local admission contract:
-                // getAdmission().ensure(agentId, { agent: local }).
                 const value = local
-                    ? await getAdmission().ensure(agentId, { agent: build ? { ...build, metadata: { ...local.metadata, ...build.metadata, local: true } } : local })
+                    ? await getAdmission().ensure(agentId, { cwd: payload?.cwd, requestedPresetId: payload?.presetId,
+                        agent: build ? { ...build, metadata: { ...local.metadata, ...build.metadata, local: true } } : local })
                     : await getAdmission().ensure(agentId);
                 return { ok: true, value };
             }

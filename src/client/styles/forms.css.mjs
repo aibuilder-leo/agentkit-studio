@@ -4,8 +4,12 @@ export default String.raw`
 .studio-start-card { display: grid; gap: 8px; text-align: left; padding: 20px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 16px; background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); font: inherit; cursor: pointer; }
 .studio-start-card strong { font-size: 14px; font-weight: 500; }
 .studio-start-card small { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
-.studio-start-card[data-primary] { background: var(--dsw-alias-button-primary-fill); color: var(--dsw-alias-label-primary-foreground); border-color: transparent; }
-.studio-start-card[data-primary] small, .studio-start-card[data-primary] .studio-tile { color: inherit; }
+/* The recommended card is a tinted surface with a filled glyph tile, not a
+   full-bleed dark fill: three cards in a row make a solid primary fill read as
+   a heavy slab, and the shared secondary-button hover rule repaints the
+   background light while the label stays white. */
+.studio-start-card[data-primary] { background: var(--dsw-alias-bg-layer-2); border-color: var(--dsw-alias-border-l2); }
+.studio-start-card[data-primary] .studio-tile { background: var(--dsw-alias-button-primary-fill); color: var(--dsw-alias-label-primary-foreground); border-color: transparent; }
 .studio-credential-note { display: flex; justify-content: space-between; align-items: center; gap: 12px; border-radius: 10px; padding: 8px 12px; background: var(--dsw-alias-state-warn-tertiary); color: var(--dsw-alias-state-warn-primary); font-size: 13px; }
 .studio-credential-note > span, .studio-inline-note { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .studio-credential-note button { flex: none; }
@@ -34,6 +38,9 @@ export default String.raw`
 .studio-task-switch::after { content: ''; position: absolute; left: 2px; top: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--dsw-alias-label-primary-foreground); }
 .studio-task-switch[aria-checked=true] { background: var(--dsw-alias-button-primary-fill); }
 .studio-task-switch[aria-checked=true]::after { left: 14px; }
+/* The shared neutral hover rule is excluded for switches, so give them their
+   own affordance that never repaints the track under the white knob. */
+.studio-task-switch:not(:disabled):hover { opacity: .85; }
 .studio-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .resource-library .resource-toolbar > [data-studio-pager] { order: -1; }
 .resource-library .resource-toolbar > input[type=search] { margin-left: auto; }
@@ -68,8 +75,8 @@ export default String.raw`
 .studio-list-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding-top: 12px; border-top: .5px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); font-size: 12px; }
 .studio-page-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
 .studio-page-header h1 { margin: 0; font-size: 20px; line-height: 28px; font-weight: 500; color: var(--dsw-alias-label-primary); }
-.studio-agent-hub:has([data-studio-agent-form]) > [data-studio-drag-region] { display: none; }
-.studio-agent-hub:has([data-studio-agent-form]) > [data-agentkit-studio] { padding-top: 28px !important; }
+.studio-agent-hub:has(:is([data-studio-agent-form],[data-studio-agent-detail])) > [data-studio-drag-region] { display: none; }
+.studio-agent-hub:has(:is([data-studio-agent-form],[data-studio-agent-detail])) > [data-agentkit-studio] { padding-top: 28px !important; }
 .studio-toolbar-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .studio-toolbar-controls > button { width: 32px; border: 0; padding: 0; }
 .studio-pick-quiet { width: auto !important; height: 32px !important; margin: 0 !important; border: 0 !important; box-shadow: none !important; background-color: transparent !important; color: var(--dsw-alias-label-secondary); font-size: 13px; }
@@ -144,6 +151,41 @@ export default String.raw`
 [data-studio-settings] [data-studio-settings-group] > h3 { margin: 0 0 8px; font-size: 14px; font-weight: 500; color: var(--dsw-alias-label-secondary); }
 .studio-settings-panel { padding: 0 16px; border: .5px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-xl,16px); }
 .studio-settings-panel > [data-studio-settings-row]:last-child { border-bottom: 0; }
+.studio-privacy { margin-bottom: 24px; }
+.studio-privacy-summary {
+  display: flex; align-items: center; gap: 8px; min-height: 44px;
+  list-style: none; cursor: pointer;
+}
+.studio-privacy-summary::-webkit-details-marker { display: none; }
+.studio-privacy-summary::after {
+  content: ""; flex: none; width: 6px; height: 6px; margin-inline: 2px 3px;
+  border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(-45deg);
+}
+details[open] > .studio-privacy-summary::after { transform: rotate(45deg); }
+.studio-privacy-state { margin-inline-start: auto; }
+.studio-privacy-state, .studio-privacy-details > summary { color: var(--dsw-alias-label-secondary); font-size: 12px; }
+.studio-privacy-body { padding: 4px 0 10px; border-top: .5px solid var(--dsw-alias-border-l2); }
+.studio-privacy-body > .agentkit-form-note { margin: 8px 0 0; }
+.studio-privacy-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; }
+.studio-privacy-row > div { min-width: 0; }
+.studio-privacy-row .agentkit-form-note { margin-top: 1px; }
+.studio-privacy-details > summary { justify-content: space-between; min-height: 34px; }
+.studio-privacy-details > p { overflow-wrap: anywhere; }
+.studio-privacy-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 6px -6px 0; }
+.studio-privacy-management { padding-top: 6px; }
+.studio-privacy .studio-privacy-action {
+  flex: none; min-height: 28px; padding: 0 6px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--dsw-alias-label-secondary); font-size: 12px; cursor: pointer;
+}
+.studio-privacy .studio-privacy-action:disabled { opacity: .5; cursor: default; }
+.studio-privacy-preview pre {
+  max-height: 156px; overflow: auto; margin: 4px 0 0; padding: 8px;
+  border-radius: 8px; background: var(--dsw-alias-bg-layer-2); white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: 11px; line-height: 16px;
+}
+.studio-privacy-summary:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary); outline-offset: 2px; border-radius: 4px;
+}
 .studio-automation-surface > [data-studio-heading] { justify-content: flex-end !important; gap: 8px !important; }
 .studio-automation-surface > [data-studio-heading] h2 { display: none; }
 [data-studio-settings-row] { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 16px 0; border-bottom: .5px solid var(--dsw-alias-border-l2); }
@@ -152,7 +194,7 @@ export default String.raw`
 [data-studio-settings-row] > span { max-width: 55%; text-align: right; overflow-wrap: anywhere; color: var(--dsw-alias-label-secondary); font-size: 13px; }
 [data-studio-settings] .agentkit-guide-entry { margin-top: 8px; padding-top: 16px; border-top: .5px solid var(--dsw-alias-border-l2); }
 :where([data-studio-settings], [data-studio-model-settings], [data-studio-agent-form], .agentkit-start-checks) button { font: inherit; }
-:where([data-studio-settings], .agentkit-start-checks) button:not(:disabled):hover { background: var(--dsw-alias-interactive-bg-hover); }
+:where([data-studio-settings], .agentkit-start-checks) button:not(:disabled):not([role="switch"]):hover { background: var(--dsw-alias-interactive-bg-hover); }
 :where([data-studio-settings], [data-studio-agent-form], .agentkit-start-checks) :is(button,input,select,textarea):focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary); outline-offset: 2px; }
 /* The model settings surface owns its layout, control and chip styles in
    styles/model-settings.css.mjs; keep this sheet free of overrides for it. */
@@ -179,5 +221,18 @@ export default String.raw`
   .studio-row-main { flex-basis: calc(100% - 56px); }
   .studio-srow-label { flex-basis: 100%; }
   .studio-srow-control { max-width: 100%; flex-wrap: wrap; }
+}
+
+/* The built-in plugin slot supplies a summary. Place its toggle in the
+   card action position used by the installed and experimental plugins. */
+[data-plugin-item="agentkit-star-harness"] .studio-star-harness-summary:has(.studio-star-harness-toggle) {
+  padding-inline-end: 44px;
+}
+[data-plugin-item="agentkit-star-harness"] .studio-star-harness-toggle {
+  position: absolute;
+  inset-inline-end: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 1;
 }
 `;

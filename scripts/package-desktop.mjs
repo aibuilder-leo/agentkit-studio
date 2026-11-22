@@ -15,6 +15,7 @@ import { resolveProductInputs } from './product-config.mjs';
 import { createBuildOutputRedactor } from './build-output-redaction.mjs';
 import { finished } from 'node:stream/promises';
 import { verifyPackagedUpdateSource } from './packaged-update-source.mjs';
+import { stageDesktopTelemetryInputs } from './desktop-telemetry-inputs.mjs';
 
 const credentialPaths = new Set(['DSH_DESKTOP_MACOS_SIGNING_KEYCHAIN','DSH_DESKTOP_WINDOWS_CER_FILE','DSH_DESKTOP_WINDOWS_SIGNTOOL','APPLE_API_KEY','APPLE_KEYCHAIN','CSC_LINK']);
 
@@ -82,7 +83,10 @@ export async function packageDesktop(options) {
   const { manifest: patchManifest } = await checkPatchManifest(options.patches, { baseCommit: options.commit });
   const product = resolveProductInputs({ target, dshVersion, buildVersion: requestedBuildVersion, pluginVersion: options.studioVersion });
   const { pluginVersion: studioVersion, desktopVersion: buildVersion } = product;
-  const environment=packageManagerEnvironment({ ...product.environment, ...process.env });
+  const environment=packageManagerEnvironment({
+    ...product.environment, ...process.env,
+    DSH_DESKTOP_DEFAULT_PLUGIN_INDEX_URL: product.defaultPluginIndexUrl ?? '',
+  });
   const manager = packageManagerInvocation(process.platform, environment, options.pnpmScript);
   const invoke = (args, cwd) => run(manager.command, [...manager.args, ...args], cwd, environment);
   return withDesktopCheckout(options,async checkout=>{
@@ -91,11 +95,13 @@ export async function packageDesktop(options) {
     if(manifest.version!==dshVersion) throw new Error('desktop packaging: DSH version does not match source snapshot');
     const settingsName=target==='win-x64'?'.env.windows':'.env.macos';
     const settingsPath=join(checkout,'apps/desktop',settingsName);
-    let copiedSettings=false, updateSettings;
+    let copiedSettings=false, updateSettings, telemetryInputs;
     const inputs=await snapshotDesktopPluginInputs(environment.DSH_DESKTOP_PLUGIN_INPUTS,dirname(checkout));
     environment.DSH_DESKTOP_PLUGIN_INPUTS=inputs.value;
     const image=join(checkout,`apps/desktop/.desktop-build/targets/${target}/unsigned-artifacts/deepseek-harness-${buildVersion ?? dshVersion}-${target}-unsigned.dmg`);
     try {
+      telemetryInputs = await stageDesktopTelemetryInputs(dirname(checkout), environment);
+      environment.DSH_STUDIO_TELEMETRY_RESOURCES = telemetryInputs.directory;
       // Signed builds retain the official file-owned configuration and relative credential semantics.
       // No profile, authentication directory or arbitrary ignored file enters the source snapshot.
       if(!unsigned || target==='win-x64') {
@@ -136,7 +142,10 @@ export async function packageDesktop(options) {
       return {artifacts};
     } finally {
       try { if(copiedSettings) await rm(settingsPath,{force:true}); }
-      finally { await inputs.dispose(); }
+      finally {
+        try { await telemetryInputs?.dispose(); }
+        finally { await inputs.dispose(); }
+      }
     }
   });
 }

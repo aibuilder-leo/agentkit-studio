@@ -18,7 +18,7 @@
         "testFile": "apps/desktop/tests/main-startup.spec.ts",
         "passed": 114,
         "failed": 0,
-        "evidence": "docs/refactor-patches.md"
+        "evidence": "docs-site/content/docs/contributing/patches.mdx"
       }
     },
     {
@@ -27,7 +27,7 @@
       "equivalence": {
         "replacement": "035",
         "patchedTree": "c2426c392335dde1ca31d5373fefef1940cb01db",
-        "evidence": "docs/product-configuration.md",
+        "evidence": "docs-site/content/docs/reference/configuration.mdx",
         "remaining": "Final cross-platform and installed-update acceptance remains required."
       }
     },
@@ -37,7 +37,7 @@
       "equivalence": {
         "replacement": "035",
         "patchedTree": "c2426c392335dde1ca31d5373fefef1940cb01db",
-        "evidence": "docs/product-configuration.md",
+        "evidence": "docs-site/content/docs/reference/configuration.mdx",
         "remaining": "Final cross-platform and installed-update acceptance remains required."
       }
     },
@@ -47,7 +47,7 @@
       "equivalence": {
         "replacement": "035",
         "patchedTree": "c2426c392335dde1ca31d5373fefef1940cb01db",
-        "evidence": "docs/product-configuration.md",
+        "evidence": "docs-site/content/docs/reference/configuration.mdx",
         "remaining": "Final cross-platform and installed-update acceptance remains required."
       }
     },
@@ -57,7 +57,7 @@
       "equivalence": {
         "replacement": "035",
         "patchedTree": "c2426c392335dde1ca31d5373fefef1940cb01db",
-        "evidence": "docs/product-configuration.md",
+        "evidence": "docs-site/content/docs/reference/configuration.mdx",
         "remaining": "Final cross-platform and installed-update acceptance remains required."
       }
     },
@@ -66,7 +66,7 @@
       "reason": "Consolidated into 017 when porting the current Workspace StartSessionOptions and Agent preset flow. No old DSH runtime compatibility is supported.",
       "equivalence": {
         "replacement": "017",
-        "evidence": "docs/dsh-0.2.1-upgrade.md"
+        "evidence": "docs-site/content/docs/contributing/patches.mdx"
       }
     }
   ],
@@ -2585,12 +2585,319 @@
       },
       "sequence": 52,
       "sha256": "e903a00d71a7019eac161651f77087b2839c371bf99a64016309fe36e64d29b6"
+    },
+    {
+      "id": "084",
+      "file": "084-chat-runtime-presentation.patch",
+      "category": "product",
+      "baseCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+      "dependsOn": [
+        "058"
+      ],
+      "affectedFiles": [
+        "packages/client/ui-chat/src/client/apply.ts",
+        "packages/client/ui-chat/src/client/chat/ChatFlow.tsx",
+        "packages/client/ui-chat/src/client/chat/ChatNodeSeat.tsx",
+        "packages/client/ui-chat/src/client/chat/ChatView.module.css",
+        "packages/client/ui-chat/src/client/chat/ChatView.tsx",
+        "packages/client/ui-chat/src/client/chat/TurnTailNodeView.tsx",
+        "packages/client/ui-chat/src/client/chat/register-node-renderers.ts",
+        "packages/client/ui-chat/src/client/contract/slots.ts",
+        "packages/client/ui-chat/tests/chat-view.client.spec.tsx",
+        "packages/client/ui-sidebar-browser/src/client/view/IframePresentation.ts",
+        "packages/client/ui-sidebar-browser/tests/browser-body.client.spec.tsx"
+      ],
+      "affectedPackages": [
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-sidebar-browser"
+      ],
+      "contracts": [
+        "A session presenter can render the transcript inside the shared Chat viewport. The default flow and shared assistant actions remain available through the same host contract."
+      ],
+      "risk": "medium",
+      "maintainerRole": "Studio UI maintainers",
+      "upstreamStatus": {
+        "state": "not-submitted",
+        "evidence": "Chat view and plugin registration regression tests."
+      },
+      "removeWhen": "The host offers a session-specific chat presenter with access to existing assistant actions.",
+      "verification": {
+        "hostTests": [
+          "packages/client/ui-chat/tests/chat-apply.client.spec.tsx",
+          "packages/client/ui-chat/tests/chat-view.client.spec.tsx",
+          "packages/client/ui-sidebar-browser/tests/browser-body.client.spec.tsx"
+        ],
+        "integrations": [
+          "source",
+          "web"
+        ]
+      },
+      "sequence": 53,
+      "sha256": "6d9f7cc2998589ccfb29fc0a78a43e7796c38a13960ae0f894b0742f0a81f15f"
+    },
+    {
+      "id": "085",
+      "file": "085-native-global-panel-right-sidebar.patch",
+      "baseCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+      "category": "product",
+      "dependsOn": [],
+      "affectedFiles": [
+        "packages/client/ui-sidebar-right/src/client/contract/slots.ts",
+        "packages/client/ui-sidebar-right/src/client/index.ts",
+        "packages/client/ui-sidebar-right/src/client/panel-surfaces.ts",
+        "packages/client/ui-sidebar-right/src/client/service.ts",
+        "packages/client/ui-sidebar-right/src/client/shell/PanelSeat.tsx",
+        "packages/client/ui-sidebar-right/src/client/shell/RightbarRoot.tsx",
+        "packages/client/ui-sidebar-right/src/client/shell/SidebarRight.tsx",
+        "packages/client/ui-sidebar-right/tests/apply.client.spec.ts",
+        "packages/client/ui-sidebar-right/tests/seat.client.spec.tsx"
+      ],
+      "affectedPackages": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ],
+      "contracts": [
+        "A global main panel may register native right-sidebar tabs without creating or borrowing a Session. The frame still owns the divider and the retained column width."
+      ],
+      "risk": "medium",
+      "maintainerRole": "Studio UI maintainers",
+      "upstreamStatus": {
+        "state": "not-submitted",
+        "evidence": "Root panel and Session sidebar switching, native tab strip, fullscreen, collapse and provider disposal regression checks."
+      },
+      "removeWhen": "DSH provides a supported native right sidebar for global main panels.",
+      "verification": {
+        "hostTests": [
+          "packages/client/ui-sidebar-right/tests/apply.client.spec.ts",
+          "packages/client/ui-sidebar-right/tests/seat.client.spec.tsx"
+        ],
+        "integrations": [
+          "source",
+          "web",
+          "electron"
+        ]
+      },
+      "sequence": 54,
+      "sha256": "7380ea061ed964fe8a450749a9f22f7a4f09439834940c46bd2d8cad11bef58e"
+    },
+    {
+      "id": "086",
+      "file": "086-studio-desktop-telemetry.patch",
+      "category": "product",
+      "risk": "high",
+      "baseCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+      "maintainerRole": "Studio desktop maintainers",
+      "removeWhen": "Studio packaging and the upstream Host provide an equivalent first-party telemetry lifecycle and tested privacy gates.",
+      "contracts": [
+        "Studio Desktop disables inherited DSH product and session exporters after all profile overlays.",
+        "Studio telemetry is loaded only from the packaged product resource or a development fixture.",
+        "The Desktop main process gates collection on the saved privacy preferences, persists the outbox and sends to its configured receiver.",
+        "Host Run messages and sender-bound settings operations do not expose a telemetry uploader to Web or renderer code."
+      ],
+      "affectedPackages": [
+        "apps/desktop",
+        "packages/boot/app-boot"
+      ],
+      "affectedFiles": [
+        "apps/desktop/electron-builder.config.d.mts",
+        "apps/desktop/scripts/electron-builder-config.mjs",
+        "apps/desktop/src/host-process.ts",
+        "apps/desktop/src/ipc.ts",
+        "apps/desktop/src/main.ts",
+        "apps/desktop/src/preload-app.ts",
+        "apps/desktop/src/studio-telemetry.ts",
+        "packages/boot/app-boot/src/profile-context.ts",
+        "packages/boot/app-boot/tests/profile.spec.ts"
+      ],
+      "dependsOn": [
+        "030",
+        "033",
+        "039",
+        "064",
+        "082",
+        "083"
+      ],
+      "upstreamStatus": {
+        "state": "not-submitted",
+        "evidence": "Studio-specific collection policy and packaging resource."
+      },
+      "verification": {
+        "hostTests": [
+          "apps/desktop/tests/preload-app.spec.ts",
+          "apps/desktop/tests/product-branding.spec.ts",
+          "packages/boot/app-boot/tests/profile.spec.ts"
+        ],
+        "integrations": [
+          "source",
+          "electron",
+          "product-profiles",
+          "macos",
+          "windows"
+        ]
+      },
+      "sequence": 55,
+      "sha256": "5af46178d8f306c8f29cff579ab6c06d56acd0789cfcdabfdd77e0294a341af0"
+    },
+    {
+      "id": "087",
+      "file": "087-plugin-market-tarball-sources.patch",
+      "sequence": 56,
+      "category": "product",
+      "risk": "medium",
+      "baseCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+      "maintainerRole": "Studio plugin market maintainers",
+      "removeWhen": "The pinned DSH release supports tarball sources and shows the download address before confirmation.",
+      "contracts": [
+        "Format 1 indexes accept an absolute HTTP(S) tarball URL and preserve npm and Git sources.",
+        "Discover displays the archive URL and passes it to the existing confirmed installation flow.",
+        "Index browsing and details use index metadata and the declared repository without downloading the archive."
+      ],
+      "affectedPackages": [
+        "packages/boot/plugin-market",
+        "packages/client/ui-plugin-market",
+        "packages/util/plugin-market-index"
+      ],
+      "affectedFiles": [
+        ".agents/notes/implemented/feature/2026-10-02-plugin-market-index-format.i18n.yaml",
+        ".agents/notes/implemented/feature/2026-10-02-plugin-market-index-format.md",
+        ".agents/notes/implemented/feature/2026-10-02-plugin-market-index-format.zh.md",
+        "packages/boot/plugin-market/README.i18n.yaml",
+        "packages/boot/plugin-market/README.md",
+        "packages/boot/plugin-market/README.zh.md",
+        "packages/boot/plugin-market/src/index.ts",
+        "packages/boot/plugin-market/tests/detail-remote.spec.ts",
+        "packages/client/ui-plugin-market/README.i18n.yaml",
+        "packages/client/ui-plugin-market/README.md",
+        "packages/client/ui-plugin-market/README.zh.md",
+        "packages/client/ui-plugin-market/src/client/DiscoverSection.tsx",
+        "packages/client/ui-plugin-market/src/client/locales.ts",
+        "packages/client/ui-plugin-market/src/client/presentation.ts",
+        "packages/client/ui-plugin-market/tests/discover.client.spec.tsx",
+        "packages/util/plugin-market-index/README.i18n.yaml",
+        "packages/util/plugin-market-index/README.md",
+        "packages/util/plugin-market-index/README.zh.md",
+        "packages/util/plugin-market-index/src/index.ts",
+        "packages/util/plugin-market-index/src/types.ts",
+        "packages/util/plugin-market-index/tests/plugin-market-index.spec.ts"
+      ],
+      "dependsOn": [],
+      "upstreamStatus": {
+        "state": "not-submitted",
+        "evidence": "Studio supports plugin bundles distributed through object storage."
+      },
+      "verification": {
+        "hostTests": [
+          "packages/util/plugin-market-index/tests/plugin-market-index.spec.ts",
+          "packages/boot/plugin-market/tests/detail-remote.spec.ts",
+          "packages/client/ui-plugin-market/tests/discover.client.spec.tsx"
+        ],
+        "integrations": [
+          "source",
+          "web"
+        ]
+      },
+      "sha256": "b4257332cd79421b20f34b3c2909555ccaa6b1422dee87842ef11a3c49656bd9"
+    },
+    {
+      "id": "088",
+      "file": "088-desktop-default-plugin-index.patch",
+      "sequence": 57,
+      "category": "product",
+      "risk": "medium",
+      "baseCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+      "maintainerRole": "Studio desktop and plugin market maintainers",
+      "removeWhen": "The pinned DSH Desktop supports a packaged default index and profile migration.",
+      "contracts": [
+        "macOS and Windows package a configured HTTPS index and ship Discover enabled for new and existing Desktop profiles.",
+        "The Desktop Host puts the product source first and preserves distinct existing sources before sending renderer readiness.",
+        "A profile applies the default once per Desktop version and URL, with retry after a failed settings write."
+      ],
+      "affectedPackages": [
+        "apps/desktop",
+        "apps/desktop-host"
+      ],
+      "affectedFiles": [
+        "apps/desktop-host/src/index.ts",
+        "apps/desktop-host/src/plugin-market-default.ts",
+        "apps/desktop-host/tests/plugin-market-default.spec.ts",
+        "apps/desktop/README.i18n.yaml",
+        "apps/desktop/README.md",
+        "apps/desktop/README.zh.md",
+        "apps/desktop/src/project-manager.ts",
+        "apps/desktop/tests/core-package-set.spec.ts"
+      ],
+      "dependsOn": [
+        "064",
+        "078",
+        "082",
+        "083"
+      ],
+      "upstreamStatus": {
+        "state": "not-submitted",
+        "evidence": "Studio Desktop supplies an optional product plugin index from its installer."
+      },
+      "verification": {
+        "hostTests": [
+          "apps/desktop-host/tests/plugin-market-default.spec.ts",
+          "apps/desktop/tests/core-package-set.spec.ts",
+          "apps/desktop/tests/project-manager.spec.ts"
+        ],
+        "integrations": [
+          "source",
+          "macos",
+          "windows",
+          "product-profiles"
+        ]
+      },
+      "sha256": "28f591d4d304d940696f55a37b5de8e41cbb191056fdef9bfcbc087f60ded17a"
+    },
+    {
+      "id": "089",
+      "file": "089-model-reasoning-defaults.patch",
+      "category": "general-fix",
+      "baseCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+      "risk": "medium",
+      "maintainerRole": "Studio DSH integration maintainers",
+      "removeWhen": "The pinned DSH baseline supports a validated reasoning default per model.",
+      "contracts": [
+        "A model-specific default reaches selectors and request dispatch for its exact route and model.",
+        "An explicit session effort takes precedence. Models without overrides retain their route behavior."
+      ],
+      "affectedPackages": [
+        "packages/llm/llm-pi-ai"
+      ],
+      "affectedFiles": [
+        "packages/llm/llm-pi-ai/README.md",
+        "packages/llm/llm-pi-ai/README.zh.md",
+        "packages/llm/llm-pi-ai/src/adapter.ts",
+        "packages/llm/llm-pi-ai/src/catalog.ts",
+        "packages/llm/llm-pi-ai/src/config.ts",
+        "packages/llm/llm-pi-ai/src/models.ts",
+        "packages/llm/llm-pi-ai/tests/adapter.spec.ts",
+        "packages/llm/llm-pi-ai/tests/catalog.spec.ts"
+      ],
+      "dependsOn": [],
+      "upstreamStatus": {
+        "state": "not-submitted",
+        "evidence": "Studio model settings integration."
+      },
+      "verification": {
+        "hostTests": [
+          "packages/llm/llm-pi-ai/tests/adapter.spec.ts",
+          "packages/llm/llm-pi-ai/tests/catalog.spec.ts"
+        ],
+        "integrations": [
+          "source",
+          "dsh-web"
+        ]
+      },
+      "sequence": 58,
+      "sha256": "ca54412de425d3c41bd739ed0a0ea391523b229bc28219b891ac15ccedf55721"
     }
   ],
-  "patchedTree": "528711c889fd7041f3caf55c9c114bdf7e5de89d",
-  "patchedSourceSha256": "5ed309d1cff802a585331425bbd2c2ad8ee2011de149ee0416347c89245ae43b",
+  "patchedTree": "c4bcfd7fa07d3429a053441c1bfa551a43e1dca4",
+  "patchedSourceSha256": "44128b8498c10d2b0e5048c520f5386a3f1f83dcbd839de086c60419591dcdee",
   "maintenanceSource": {
     "descriptor": "source.json",
-    "sha256": "162f9bed2d85110d7358575efb07221cdcd346715b0e208b165593204669dbab"
+    "sha256": "57dab6ec2a2665fcee7613a843139d0991197c596844891926148c919962b202"
   }
 }

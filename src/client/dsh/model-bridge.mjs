@@ -2,6 +2,7 @@ import { isCredentialRefName } from '../../credential-ref.mjs';
 import { normalizeModelEndpoint } from '../../model-endpoint.mjs';
 import { admitModelCapabilities } from '@kingsoftcloud/agentkit-harness-core/model-capabilities';
 import { studioReasoning } from '../../model-reasoning.mjs';
+import { providerWireApi } from '../../model-profile-contract.mjs';
 export const MODEL_CREDENTIAL_NAMES = ['AGENTKIT_MODEL_API_KEY', 'OPENAI_API_KEY'];
 
 export const DEFAULT_KSYUN_BASE_URL = 'http://kspmas.ksyun.com/v1';
@@ -45,6 +46,10 @@ export function createModelBridge({ hostRemote }) {
     const applyProfiles = async ({ profiles, keys = {} }) => {
       const document = await describe();
       const namespace = (document.namespaces || []).find(item => item.ns === DSH_MODEL_SETTINGS_NS);
+      // Studio's bundled Host exposes model-specific defaults. A stock Host
+      // can still take a route default when the route serves a single model.
+      const supportsModelDefaults = Object.values(namespace?.schema?.refs || {})
+        .some(schema => Object.hasOwn(schema?.dict || {}, 'defaultReasoningEffort'));
       const valid = profiles.filter(profile => profile?.enabled !== false && String(profile?.modelName || '').trim())
         .sort((left, right) => Number(right.default === true) - Number(left.default === true));
       if (!valid.length) throw new Error('至少保留一个模型配置');
@@ -58,24 +63,50 @@ export function createModelBridge({ hostRemote }) {
         if (!baseUrl) throw new Error(`模型 ${modelName} 需要填写 API 地址`);
         const credentialName = modelCredentialName(profile, index);
         const reasoning = studioReasoning(profile);
+        const reasoningEfforts = reasoning?.efforts ?? (profile.reasoningLevels?.length === 0 ? false : undefined);
+        // Kspmas model metadata is multimodal, but custom DSH routes fall
+        // back to text-only unless the capability is declared explicitly.
+        // Keep the input contract on each profile so read_image and native
+        // image messages are admitted consistently with the upstream model.
+        const items = catalogs[index]?.items || [];
+        const fallback = { id: modelName, name: modelName, input: profile.input || ['text'] };
+        const configuredModel = items.find(item => item.id === modelName);
+        // Keep catalog siblings on legacy routes for existing selections.
+        const routedModels = profile.modelOnly ? [configuredModel || fallback] : configuredModel ? items : [...items, fallback];
+        const dedicated = routedModels.length === 1;
+        const models = routedModels
+          .map(model => {
+            const configured = model.id === modelName;
+            const capability = admitModelCapabilities({ ...profile, input: configured ? profile.input : undefined }, model);
+            return { id: model.id, name: model.name || model.id, contextWindow: capability.contextWindow,
+              maxTokens: capability.maxOutputTokens, input: capability.input,
+              ...(configured && reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
+              ...(configured && reasoning && supportsModelDefaults && !dedicated ? { defaultReasoningEffort: reasoning.defaultEffort } : {}) };
+          });
+        const wire = providerWireApi(profile);
         return { route, modelName, provider, baseUrl, credentialName, operation: { op: 'set', path: ['providers', route], value: {
-          displayName: `${provider} · ${modelName}`, api: 'openai-completions', apiKeyEnv: credentialName,
+          displayName: `${provider} · ${modelName}`, api: wire, apiKeyEnv: credentialName,
           baseURL: baseUrl,
-          // A concrete route default keeps fresh sessions on a thinking level
-          // instead of DSH's "provider default" row, which would omit the
-          // parameter and leave thinking to the gateway's own default.
-          ...(reasoning ? { reasoning: reasoning.defaultEffort } : {}),
-          // Kspmas model metadata is multimodal, but custom DSH routes fall
-          // back to text-only unless the capability is declared explicitly.
-          // Keep the input contract on each profile so read_image and native
-          // image messages are admitted consistently with the upstream model.
-          models: (catalogs[index]?.items?.length ? catalogs[index].items : [{ id: modelName, name: modelName, input: profile.input || ['text'] }])
-            .map(model => {
-              const capability = admitModelCapabilities({ ...profile, input: model.id === modelName ? profile.input : undefined }, model);
-              return { id: model.id, name: model.name || model.id, contextWindow: capability.contextWindow,
-                maxTokens: capability.maxOutputTokens, input: capability.input,
-                ...(reasoning && model.id === modelName ? { reasoningEfforts: reasoning.efforts } : {}) };
-            }),
+          // Kspmas validates message roles and answers
+          // `400 Invalid request: role 'developer' is not allowed`. pi-ai sends
+          // the system prompt as `developer` to every reasoning model on a route
+          // it does not detect as non-standard, and a Studio route is always an
+          // OpenAI-compatible gateway pi-ai cannot know: keep `system`.
+          //
+          // `store` is the same story one field over: the proxy is stateless
+          // (a `previous_response_id` is refused outright), so a gateway that
+          // only implements the older request shape — LiteLLM and friends —
+          // rejects the key itself, and dropping it costs a stateless route
+          // nothing it could have used.
+          //
+          // It is also an `openai-completions`-only key. DSH rejects a route
+          // that sets it while no model speaks that protocol — exactly the
+          // case a profile declaring `protocol: openai-responses` creates —
+          // so it is conditional on the wire this route actually uses.
+          compat: { supportsDeveloperRole: false, ...(wire === 'openai-completions' ? { supportsStore: false } : {}) },
+          // A route default would also be sent to every catalog sibling.
+          ...(reasoning && dedicated ? { reasoning: reasoning.defaultEffort } : {}),
+          models,
         } } };
       });
       const response = await ctx.remote.settings.mutate(DSH_MODEL_SETTINGS_NS, [
@@ -87,8 +118,16 @@ export function createModelBridge({ hostRemote }) {
       const defaultNamespace = (await describe()).namespaces?.find(item => item.ns === DSH_DEFAULT_MODEL_SETTINGS_NS);
       if (!defaultNamespace) throw new Error('DSH 默认模型设置不可用，无法让新会话使用该模型');
       const first = operations[0];
+      // The default effort belongs to the default model: a level left behind by
+      // an earlier profile makes every fresh session fail with
+      // `UNSUPPORTED_REASONING_EFFORT` for a level this model never declared,
+      // so a profile without a reasoning declaration must clear the field.
+      const defaultEffort = studioReasoning(valid[0])?.defaultEffort;
       const defaultResponse = await ctx.remote.settings.mutate(DSH_DEFAULT_MODEL_SETTINGS_NS, [
         { op: 'set', path: ['provider'], value: first.route }, { op: 'set', path: ['model'], value: first.modelName },
+        defaultEffort
+          ? { op: 'set', path: ['reasoningEffort'], value: defaultEffort }
+          : { op: 'unset', path: ['reasoningEffort'] },
       ], defaultNamespace.revision);
       checkActive();
       if (!defaultResponse?.ok) throw new Error(defaultResponse?.error?.message || 'DSH 默认模型保存失败');

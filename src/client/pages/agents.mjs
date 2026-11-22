@@ -1,7 +1,7 @@
 import { createFormKit } from '../components/form-kit.mjs';
-import { focusOperations } from '../operations-focus.mjs';
 import { createHeaderAction } from '../components/header-action.mjs';
 import { refreshIcon } from '../components/refresh-icon.mjs';
+import { MANUAL_AGENT_CREATE_EVENT, consumeManualAgentCreate } from '../state/agent-create-intent.mjs';
 
 export function createAgentPages({
   ui,
@@ -14,17 +14,43 @@ export function createAgentPages({
     const [view, setView] = useState('list');
     const [tab, setTab] = useState('local');
     const [created, setCreated] = useState(null);
-    const [editingAgent, setEditingAgent] = useState(null);
+    const [detail, setDetail] = useState(null);
+    // The Overview start card asks for the manual form from another panel. This
+    // workspace owns the list/create/edit view state, so it opens the form from
+    // the announced intent and also consumes one that arrived before mounting.
+    useEffect(() => {
+      const openManualCreate = () => { consumeManualAgentCreate(); setView('create'); };
+      window.addEventListener(MANUAL_AGENT_CREATE_EVENT, openManualCreate);
+      if (consumeManualAgentCreate()) setView('create');
+      return () => window.removeEventListener(MANUAL_AGENT_CREATE_EVENT, openManualCreate);
+    }, []);
     if (view === 'create') {
       return h(AgentCreatePage, {
         onBack: () => setView('list'),
         onCreated: agent => { setCreated(agent); setTab('local'); setView('list'); },
       });
     }
-    if (view === 'edit') return h(AgentEditPage, {
-      agentId: editingAgent,
+    // Configuration, build and deployment are managed inside the Agent itself.
+    // A cloud deployment row opens the local Agent that owns it.
+    const openDetail = (agent, panel = 'config', section) => {
+      const metadata = agent?.metadata || agent || {};
+      const owned = agent?.source === 'studio-deployment' ? agent.deployment : null;
+      const id = owned?.agentId || metadata.id || agent?.id;
+      setDetail({ panel,
+        agent: { id, chatId: metadata.id || agent?.id || id, name: (owned && owned.agentName) || metadata.name || agent?.name, revision: owned ? undefined : metadata.revision,
+          runtime: agent?.spec?.runtime?.type || agent?.runtime?.type, deliverable: !agent?.managedRuntime, chatDisabled: agent?.deployment?.available === false },
+        focus: section ? { agentId: id, section, ...(owned?.id ? { deploymentId: owned.id } : {}) } : null });
+      setCreated(null);
+      setView('detail');
+    };
+    if (view === 'detail') return h(AgentDetailPage, {
+      key: detail.agent.id, agent: detail.agent, initialPanel: detail.panel, initialFocus: detail.focus,
       onBack: () => setView('list'),
-      onSaved: agent => { setCreated({ ...agent, updated: true }); setView('list'); window.dispatchEvent(new CustomEvent('agentkit-studio:cloud-agent-changed')); },
+      onBindAgent: id => actions.bindAgent(id),
+      onSaved: agent => {
+        window.dispatchEvent(new CustomEvent('agentkit-studio:cloud-agent-changed'));
+        if (!detail.agent.deliverable) { setCreated({ ...agent, updated: true }); setView('list'); }
+      },
     });
     return h(AgentsPage, {
       created,
@@ -33,13 +59,52 @@ export function createAgentPages({
       onNavigate,
       tab,
       onTabChange: setTab,
-      onEdit: agent => { setEditingAgent(agent?.metadata?.id || agent.id); setView('edit'); },
+      onEdit: agent => openDetail(agent, 'config'),
+      onDeliver: (agent, section) => openDetail(agent, 'delivery', section),
       onBindAgent: agent => actions.bindAgent(agent?.metadata?.id || agent?.id),
       onCreate: mode => { setCreated(null); if (mode === 'conversation') window.dispatchEvent(new CustomEvent('agentkit-studio:open-authoring')); else setView('create'); },
     });
   }
 
-  function AgentsPage({ onCreate, created, onNavigate, onBindAgent, onEdit, tab, onTabChange, onDeleteLocal, onDeleteManaged }) {
+  function AgentDetailPage({ agent, initialPanel = 'config', initialFocus = null, onBack, onSaved, onBindAgent }) {
+    const [panel, setPanel] = useState(agent.deliverable ? initialPanel : 'config');
+    const [focus, setFocus] = useState(initialFocus);
+    const [summary, setSummary] = useState(agent);
+    const [saved, setSaved] = useState(null);
+    const [formVersion, setFormVersion] = useState(0);
+    const [binding, setBinding] = useState(false);
+    const { DeliveryPage } = ui;
+    const bind = async () => {
+      if (binding) return;
+      setBinding(true);
+      try { await onBindAgent?.(summary.chatId || summary.id); } finally { setBinding(false); }
+    };
+    const handleSaved = result => {
+      onSaved?.(result);
+      if (!summary.deliverable) return;
+      // Saving creates a new revision: reload the form on it and continue with the build step.
+      setSummary(previous => ({ ...previous, name: result?.name || previous.name, revision: result?.revision || previous.revision }));
+      setSaved(result);
+      setFormVersion(value => value + 1);
+      setFocus({ agentId: summary.id, section: 'build' });
+      setPanel('delivery');
+    };
+    return h('div', { 'data-studio-agent-detail': 'true' },
+      Button({ onClick: onBack, variant: 'ghost', size: 'sm', className: 'af-back', 'aria-label': '返回 Agents', title: '返回 Agents' }, '‹ 智能体'),
+      h('header', { className: 'ak-detail-head' },
+        h('div', { className: 'studio-tile', 'aria-hidden': 'true' }, '✦'),
+        h('div', { className: 'studio-row-main' },
+          h('div', { className: 'studio-row-title' }, h('strong', null, summary.name || summary.id), h('code', { className: 'studio-row-id' }, summary.id)),
+          h('div', { className: 'studio-row-meta' }, [RUNTIME_LABELS[summary.runtime] || summary.runtime, summary.revision ? `r${summary.revision}` : ''].filter(Boolean).join(' · '))),
+        Button({ size: 'sm', variant: 'outline', className: 'ak-detail-chat', disabled: binding || summary.chatDisabled, onClick: () => void bind() }, binding ? '正在绑定…' : '对话')),
+      summary.deliverable ? h(StudioSubnav, { variant: 'segmented', ariaLabel: 'Agent 管理', value: panel, onChange: setPanel, items: [{ id: 'config', label: '配置' }, { id: 'delivery', label: '构建与部署' }] }) : null,
+      saved && panel === 'delivery' ? h('div', { role: 'status', className: 'ak-agents-notice' }, `已保存 ${saved.name || saved.id}（r${saved.revision || 1}），重新构建后对话和部署才会使用新配置。`) : null,
+      h('div', { 'data-agent-panel': 'config', hidden: panel !== 'config' },
+        h(AgentEditPage, { key: formVersion, agentId: summary.id, embedded: true, onBack, onSaved: handleSaved })),
+      panel === 'delivery' && DeliveryPage ? h('div', { 'data-agent-panel': 'delivery' }, h(DeliveryPage, { agentId: summary.id, focus })) : null);
+  }
+
+  function AgentsPage({ onCreate, created, onNavigate, onBindAgent, onEdit, onDeliver, tab, onTabChange, onDeleteLocal, onDeleteManaged }) {
     const directServerMode = Boolean(window.__AGENTKIT_STUDIO__?.controlPlane === 'agentengine-server');
     const [agents, setAgents] = useState([]);
     const [status, setStatus] = useState('loading');
@@ -130,7 +195,10 @@ export function createAgentPages({
         const built = hasCurrentBuild(agent);
         const studioDeployment = agent.source === 'studio-deployment';
         const statusLabel = studioDeployment ? (DEPLOYMENT_LABELS[agent.deployment?.state] || agent.deployment?.state) : agent.managedRuntime ? (agent.deployment?.available ? '托管可用' : (agent.metadata?.status || '托管不可用')) : built ? '已构建' : successfulBuilds(agent).length ? '有历史构建' : agent.source === 'local-studio' ? '本地配置' : '草稿';
-        const openCard = () => { if (studioDeployment) onNavigate?.('studio-operations'); else onEdit?.(agent); };
+        const openCard = () => {
+          if (studioDeployment) onDeliver?.(agent, 'deploy');
+          else onEdit?.(agent);
+        };
         const stop = event => event?.stopPropagation?.();
         return h('article', { key: id, 'data-studio-agent-card': id, tabIndex: 0, role: 'article', onClick: openCard, onKeyDown: event => { if (['Enter', ' '].includes(event.key)) { event.preventDefault(); openCard(); } }, className: 'ak-agent-card studio-row' },
           h('div', { className: 'studio-tile', 'aria-hidden': 'true' }, '✦'),
@@ -140,7 +208,7 @@ export function createAgentPages({
           h('span', { className: 'studio-st', 'data-tone': built ? 'ok' : 'neutral' }, statusLabel),
           h('div', { className: 'studio-row-actions', onClick: stop, onKeyDown: stop },
             Button({ size: 'sm', variant: 'ghost', className: 'ak-agent-chat', disabled: Boolean(bindingAgent) || agent.deployment?.available === false, onClick: event => { stop(event); void bindAgent(agent); } }, bindingAgent === (agent?.metadata?.id || agent?.id) ? '正在绑定…' : '对话'),
-            Button({ size: 'sm', variant: 'outline', onClick: event => { stop(event); if (studioDeployment || agent.managedRuntime) openCard(); else focusOperations({ window, agentId: id, section: built ? 'deploy' : 'build', onNavigate }); } }, studioDeployment ? '管理部署' : agent.managedRuntime ? '管理' : built ? '部署' : '构建'),
+            Button({ size: 'sm', variant: 'outline', onClick: event => { stop(event); if (studioDeployment || agent.managedRuntime) openCard(); else onDeliver?.(agent, built ? 'deploy' : 'build'); } }, studioDeployment ? '管理部署' : agent.managedRuntime ? '管理' : built ? '部署' : '构建'),
             h(Menu, { open: rowMenu === id, align: 'end', portal: true, compact: true, onClose: () => setRowMenu(''),
               anchor: Button({ size: 'sm', variant: 'ghost', 'aria-label': `更多操作 ${id}`, 'aria-haspopup': 'menu', 'aria-expanded': rowMenu === id, onClick: () => setRowMenu(rowMenu === id ? '' : id) }, '⋯') },
               !studioDeployment && !agent.managedRuntime ? h(MenuItemButton, { onSelect: () => { setRowMenu(''); openCard(); } }, '编辑 Agent') : null,
@@ -169,7 +237,8 @@ export function createAgentPages({
             h(MenuItemButton, { onSelect: () => { setCreateMenuOpen(false); onNavigate('experts'); } }, '从专家模板创建'))))),
       tab === 'runtime' ? h(RuntimeCatalogPage, { onNavigate }) : null,
       tab === 'runtime' ? null : h(Fragment, null,
-      created ? h('div', { role: 'status', className: 'ak-agents-notice' }, `${created.updated ? '已保存' : '已创建'} ${created.name || created.id}（r${created.revision || 1}），${created.source === 'agentengine-managed-runtime' ? '新会话将使用更新后的云端配置。' : '可在运行中心构建。'}`) : null,
+      created ? h('div', { role: 'status', className: 'ak-agents-notice' }, `${created.updated ? '已保存' : '已创建'} ${created.name || created.id}（r${created.revision || 1}）${created.source === 'agentengine-managed-runtime' ? '，新会话将使用更新后的云端配置。' : created.updated ? '。' : '，构建后可以对话和部署。'}`,
+        created.updated || created.source === 'agentengine-managed-runtime' ? null : Button({ size: 'sm', variant: 'outline', onClick: () => onDeliver?.({ metadata: { id: created.id, name: created.name, revision: created.revision } }, 'build') }, '去构建')) : null,
       status === 'loading' ? h(EmptyState, { icon: '·', title: directServerMode ? '正在读取 AgentEngine Server' : '正在读取 Host', detail: directServerMode ? '从 AgentEngine Server 读取 Agent Catalog 和运行时能力。' : '从 DSH Host 读取 Agent Catalog 和运行时能力。' }) : null,
       status === 'error' ? h(EmptyState, { icon: '!', title: directServerMode ? 'AgentEngine Server 不可达' : 'Host 尚未连接', detail: error || (directServerMode ? '请检查全局 ~/.agentkit 配置、云端凭证和网络；当前不会回退到本地 DSH Host。' : '启动本地 DSH Host 后点击刷新。'), action: h('button', { type: 'button', onClick: load, style: buttonStyle() }, '重新连接') }) : null,
       catalogWarnings.length ? h('p', { role: 'status', style: { color: BRAND.inkMuted, fontSize: '12px' } }, catalogWarnings.map(item => item.message || item).join(' ')) : null,
@@ -177,5 +246,5 @@ export function createAgentPages({
       status === 'ready' && (agents.length > 0 || query.trim()) && filteredAgents.length === 0 ? h(EmptyState, { icon: '⌕', title: '没有匹配的 Agent', detail: '调整搜索词或状态筛选。' }) : null,
       agentTable));
   }
-  return { AgentWorkspace, AgentsPage };
+  return { AgentWorkspace, AgentsPage, AgentDetailPage };
 }

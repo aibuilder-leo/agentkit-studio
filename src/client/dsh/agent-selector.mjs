@@ -114,7 +114,7 @@ export function createAgentSelector({
       }
       setBusy(true);
       try {
-        const admission = await hostRemote.ensureDshPreset(value);
+        const admission = await hostRemote.ensureDshPreset(value, '', undefined, session?.cwd ?? null);
         const selectedPreset = await studioRemote.agentPresets.select(sessionId, admission.presetId);
         // The public DSH Remote returns {ok,value}; direct registry
         // adapters return the selected preset id. Accept both contracts.

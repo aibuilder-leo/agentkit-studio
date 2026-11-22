@@ -53,13 +53,15 @@ test('the agent form uses a capped body and vertical step rail', () => {
   assert.match(block, /\.af-row-control \{ width: 100%/, 'row controls must stop sharing the line with their label');
 });
 
-test('the delivery page stacks its rows and actions on a narrow shell', () => {
+test('the delivery page collapses its rail, fields and actions on a narrow shell', () => {
   const block = deliveryStyles.slice(deliveryStyles.indexOf('@container studio-delivery (max-width: 820px)'));
   assert.ok(block.length > 0, 'missing the narrow-shell container query');
   assert.match(deliveryStyles, /container-name: studio-delivery/, 'the delivery container must be named');
-  assert.match(block, /\.af-row \{ flex-wrap: wrap/, 'rows must wrap');
-  assert.match(block, /\.af-row-control \{ width: 100%/, 'controls must take the full row');
+  assert.match(deliveryStyles, /\.ad-fields \{ display: grid; grid-template-columns: repeat\(2,/, 'fields sit in two columns on a wide shell');
   assert.match(block, /\.ad-actions \{ justify-content: flex-start/, 'actions must not stay pinned right');
+  const narrow = block.slice(block.indexOf('@container studio-delivery (max-width: 640px)'));
+  assert.match(narrow, /\[data-delivery-step\] \{ padding-left: 0; \}/, 'the step rail must give its column back');
+  assert.match(narrow, /\.ad-fields, \.ad-facts \{ grid-template-columns: minmax\(0,1fr\); \}/, 'fields must stack');
 });
 
 test('the form aligns its heading and layout to the content column', () => {

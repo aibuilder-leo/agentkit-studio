@@ -7,10 +7,25 @@ import { readClientSource } from './helpers/client-source.mjs';
 import { mountStudio } from '../src/client/dsh/mount.mjs';
 import React from 'react';
 import * as ReactDOM from 'react-dom';
+import { requireNativeConversationPresentation } from '../src/client/dsh/task-timeline.mjs';
+
+test('Native UI refuses a Host without the whole-conversation presentation seam', () => {
+  for (const slots of [{}, { snapshot: () => [] }, { snapshot: () => [{ type: 'slot', name: 'conversation.chat', kind: 'single' }] }])
+    assert.throws(() => requireNativeConversationPresentation(slots), { code: 'STUDIO_NATIVE_PRESENTATION_UNAVAILABLE' });
+  assert.doesNotThrow(() => requireNativeConversationPresentation({ snapshot: name => [{ type: 'slot', name, kind: 'single' }] }));
+});
 
 test('Studio disables the independent DSH account welcome and recharge flow', async () => {
   const entries = parse(await readFile(resolve(import.meta.dirname, '../cordis.patch.yml'), 'utf8'));
   assert.equal(entries.find(entry => entry.id === 'ui-settings-account')?.disabled, true);
+});
+
+test('Studio configures the existing DSH Agent preset registry', async () => {
+  const entries = parse(await readFile(resolve(import.meta.dirname, '../cordis.patch.yml'), 'utf8'));
+  const inserted = entries.flatMap(entry => entry.insert ?? []);
+  assert.ok(!inserted.some(entry => entry.id === 'agent-preset-registry'),
+    'dsh-web-app already inserts the registry; a second row blocks settings writes');
+  assert.equal(entries.find(entry => entry.id === 'agent-preset-registry')?.config?.default, 'standard');
 });
 
 const clientSource = await readClientSource();
@@ -77,6 +92,7 @@ test('parent Studio mounting preserves local composer services and never install
     effect: noop, on: noop, inject(_dependencies, apply) { return apply(ctx); },
     uiConversation: { events: { register: noop } },
     slots: {
+      snapshot: name => [{ type: 'slot', name, kind: 'single' }],
       inject(name, register) { injected.push(name); return register(); },
       register(options) { registered.push(options); return noop; },
     },
@@ -91,16 +107,23 @@ test('parent Studio mounting preserves local composer services and never install
   });
   assert.ok(registered.some(entry => entry.name === 'conversation.hero.agentPreset'), 'native authoring entry remains installed');
   assert.ok(registered.some(entry => entry.name === 'main' && entry.key === 'studio-overview'), 'declared panel remains installed');
+  const headerActions = registered.filter(entry => entry.name === 'conversation.session.header.actions').map(entry => entry.id);
+  assert.ok(headerActions.includes('agentkit-studio-cloud-status'));
+  assert.ok(headerActions.includes('agentkit-studio-native-children'));
+  assert.ok(!headerActions.includes('agentkit-studio-native-approval'), 'the conversation header must not poll the retired approval API');
   assert.equal(injected.includes('conversation.input.left'), false);
   assert.equal(registered.some(entry => entry.name === 'conversation.input.left' || entry.id === 'studio.assistant.attachment'), false);
   assert.equal(ctx.conversation, composer);
   assert.equal(ctx.commandUi, commandUi);
   assert.equal(ctx.sessions, sessions);
+  assert.equal(registered.some(entry => entry.id === 'agentkit.native-engine-view'), false);
 });
 
 test('model settings keep multiple providers and profiles independently configurable', () => {
   assert.match(clientSource, /modelProfiles/);
-  assert.match(clientSource, /添加提供商或模型/);
+  assert.match(clientSource, /添加提供商/);
+  assert.match(clientSource, /移除提供商/);
+  assert.match(clientSource, /从目录添加模型/);
   assert.match(clientSource, /modelProfileKeys/);
   assert.match(clientSource, /ksp\.console\.ksyun\.com\/#\/apiKey/);
   assert.match(clientSource, /applyProfiles/);
@@ -111,7 +134,8 @@ test('bound Agents use the official DSH native conversation surface', () => {
   assert.doesNotMatch(clientSource, /function BoundAgentConversationPage/);
   assert.doesNotMatch(clientSource, /onOpenConversation/);
   assert.match(clientSource, /actions\.registerBinding/);
-  assert.match(clientSource, /sessions\.create\(admission \? \{ agentPreset: admission\.presetId \} : \{\}\)/);
+  assert.match(clientSource, /const sessionOptions = admission \? \{ agentPreset: admission\.presetId \} : \{\}/);
+  assert.match(clientSource, /navCtx\.sessions\.create\(sessionOptions\)/);
   assert.match(clientSource, /uiWorkspace\.openSession\(sessionId\)/);
 });
 
@@ -176,7 +200,7 @@ test('model-only local Agent admission can use the native DSH session UI', async
   const admissionSource = await readFile(resolve(import.meta.dirname, '../src/agent-preset-admission.mjs'), 'utf8');
   assert.match(clientSource, /studioRemote\.agentPresets\.select\(sessionId, admission\.presetId\)/);
   assert.match(hostSource, /localStore\.get\(agentId\)/);
-  assert.match(hostSource, /getAdmission\(\)\.ensure\(agentId, \{ agent: local \}\)/);
+  assert.match(hostSource, /getAdmission\(\)\.ensure\(agentId, \{ cwd: payload\?\.cwd,/);
   assert.match(admissionSource, /suppliedAgent \|\| await this\.getAgent/);
   assert.match(admissionSource, /mode: bridge \? 'studio-bridge' : 'dsh-native'/);
 });
@@ -284,16 +308,8 @@ test('operational pages keep the old Studio hierarchy without stacked duplicate 
   assert.match(clientSource, /消息记录 \$\{messages.length\}/);
 });
 
-test('Studio preserves Host plugin bridge routes and the Codex lifecycle adapter', () => {
-  assert.match(clientSource, /dshPlugins: \(\) => \(bridgeAvailable\(\)\s*\?\s*studioBridgeOperation\('plugins\/dsh-list'/);
-  assert.match(clientSource, /function dshPluginMarketList/);
-  assert.match(clientSource, /refreshDshPluginIndex: \(\) => bridgeAvailable\(\) \? studioBridgeOperation\('plugins\/dsh-index-refresh'/);
+test('Studio preserves the Codex plugin lifecycle adapter', () => {
   assert.match(clientSource, /codexPlugins: \(\) => bridgeAvailable\(\) \? studioBridgeOperation\('plugins\/codex-list'/);
-  assert.match(clientSource, /installDshPlugin: /);
-  assert.match(clientSource, /enableDshPlugin: /);
-  assert.match(clientSource, /disableDshPlugin: /);
-  assert.match(clientSource, /updateDshPlugin: /);
-  assert.match(clientSource, /uninstallDshPlugin: /);
   assert.match(clientSource, /hostRemote\.installCodexPlugin/);
   assert.match(clientSource, /hostRemote\.uninstallCodexPlugin/);
   assert.match(clientSource, /data-codex-plugin-center/);
@@ -301,17 +317,18 @@ test('Studio preserves Host plugin bridge routes and the Codex lifecycle adapter
   assert.match(clientSource, /section\('插件目录'/);
 });
 
-test('the official DSH plugin center is the only visible market and carries Studio market items', () => {
-  assert.match(clientSource, /ctx\.slots\.inject\('plugins\.item'/);
-  assert.match(clientSource, /agentkit-dsh-plugin-market/);
-  assert.match(clientSource, /label: '插件市场'/);
-  assert.match(clientSource, /function DshPluginMarketItem/);
+test('the official DSH plugin center is the only market', () => {
+  // DSH owns the market: its 已安装 / 发现 tabs read the official plugin index.
+  // Studio contributes no market row of its own, so no DSH plugin surface may
+  // appear in the client.
+  assert.doesNotMatch(clientSource, /agentkit-dsh-plugin-market/);
+  assert.doesNotMatch(clientSource, /function DshPluginMarketItem/);
+  assert.doesNotMatch(clientSource, /plugins\/dsh-list/);
+  assert.doesNotMatch(clientSource, /plugins\/dsh-discover/);
+  assert.doesNotMatch(clientSource, /id: 'marketplace', label: '插件市场'/);
+  // Codex stays an official plugin item through the same public slot.
   assert.match(clientSource, /agentkit-codex-plugin-market/);
   assert.match(clientSource, /function CodexPluginMarketItem/);
-  assert.match(clientSource, /打开插件中心/);
-  // The market is a row inside the official plugin page, never a Studio
-  // sidebar panel and never a second plugin center.
-  assert.doesNotMatch(clientSource, /id: 'marketplace', label: '插件市场'/);
 });
 
 test('resource surface exposes real MCP and Skill lifecycle actions', () => {

@@ -4,6 +4,7 @@ import { dshModelSelection } from './agent-preset-admission.mjs';
 import { portableError } from './portable-resources.mjs';
 import { admitModelCapabilities } from '@kingsoftcloud/agentkit-harness-core/model-capabilities';
 import { studioReasoning } from './model-reasoning.mjs';
+import { providerWireApi } from './model-profile-contract.mjs';
 
 const OPERATING_MAX_OUTPUT_TOKENS = 8192;
 
@@ -30,8 +31,25 @@ export async function syncPortableModelProfiles({ settings, profiles, capabiliti
     routes.add(route);
     const reasoning = studioReasoning(profile);
     const facts = await profileCapabilities(profile, resolveCapabilities);
-    const value = { displayName: `${profile.provider} · ${profile.modelName}`, api: 'openai-completions', apiKeyEnv: profile.credentialName,
-      baseURL: profile.baseUrl, ...(reasoning ? { reasoning: reasoning.defaultEffort } : {}), models: [{ id: profile.modelName, name: profile.modelName,
+    const wire = providerWireApi(profile);
+    const value = { displayName: `${profile.provider} · ${profile.modelName}`, api: wire, apiKeyEnv: profile.credentialName,
+      baseURL: profile.baseUrl,
+      // Kspmas validates message roles and answers
+      // `400 Invalid request: role 'developer' is not allowed`. pi-ai sends the
+      // system prompt as `developer` to every reasoning model on a route it
+      // does not detect as non-standard, and a Studio route is always an
+      // OpenAI-compatible gateway pi-ai cannot know: keep `system`.
+      //
+      // `store` is the same story one field over: the proxy is stateless (a
+      // `previous_response_id` is refused outright), so a gateway that only
+      // implements the older request shape — LiteLLM and friends — rejects the
+      // key itself, and dropping it costs a stateless route nothing.
+      //
+      // It is also an `openai-completions`-only key; DSH rejects a route that
+      // sets it while no model speaks that protocol, which is what a profile
+      // declaring `protocol: openai-responses` would otherwise hit.
+      compat: { supportsDeveloperRole: false, ...(wire === 'openai-completions' ? { supportsStore: false } : {}) },
+      ...(reasoning ? { reasoning: reasoning.defaultEffort } : {}), models: [{ id: profile.modelName, name: profile.modelName,
         contextWindow: facts.contextWindow,
         maxTokens: profile.maxOutputTokens ?? Math.min(facts.maxOutputTokens, OPERATING_MAX_OUTPUT_TOKENS),
         input: facts.input, ...(reasoning ? { reasoningEfforts: reasoning.efforts } : {}) }] };

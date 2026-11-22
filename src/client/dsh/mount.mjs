@@ -1,6 +1,7 @@
 import { selectCloudPermissionPresentation } from './cloud-permission.mjs';
 import { codexToolDefinition } from './codex-tool.mjs';
 import { mountA2aObservation } from './a2a-observation.mjs';
+import { HARNESS_SERVICE_PRESET_SUFFIX } from '../../harness-service-preset.mjs';
 import { DEFAULT_KSYUN_BASE_URL, DEFAULT_KSYUN_MODEL, DSH_DEFAULT_MODEL_SETTINGS_NS, DSH_MODEL_CREDENTIAL, modelCredentialName } from './model-bridge.mjs';
 import { createNativeSessionBinding, selectSessionModel } from './session-entry.mjs';
 import { registerPanelNavigation } from './panel-navigation.mjs';
@@ -13,10 +14,10 @@ import { AGENTKIT_STUDIO_BRAND as PRODUCT_BRAND } from '../../brand.js';
 
 export function mountStudio(ctx, app) {
   const { ui, authoring, connectionOwner, hostRemote, actions, documentEffects, createDshModelBridge, writeConversationAgent, window, CustomEvent } = app;
-  const { React, BRAND, PANELS, StudioMark, StudioWordmark, AgentContextSelector, CloudPermissionPresentation, CloudSessionStatus, NativeApprovalPanel, CodexPluginMarketItem, DshPluginMarketItem, CredentialOnboarding, ModelSettingsSection, StudioShell, StudioPanelIcon, StudioSettingsLauncher, StudioSettingsSection } = ui;
+  const { React, BRAND, PANELS, StudioMark, StudioWordmark, AgentContextSelector, CloudPermissionPresentation, CloudSessionStatus, CodexPluginMarketItem, StarHarnessItem, CredentialOnboarding, ModelSettingsSection, StudioShell, StudioPanelIcon, StudioSettingsLauncher, StudioSettingsSection } = ui;
   const { createElement: h } = React;
   installNativeToolViews(ctx, React);
-  installTaskTimeline(ctx, { ui, hostRemote });
+  installTaskTimeline(ctx, { ui, hostRemote }, ui.installHarnessTimeline);
   installPromptPrediction(ctx, { React, h, window });
   const { adoptProductDocumentTitle, adoptProductDocumentBrand, installResponsiveStyles, installStudioFormStyles, installWindowDragRegion } = documentEffects;
   const { openAgentAuthoring } = authoring;
@@ -28,6 +29,9 @@ export function mountStudio(ctx, app) {
   ctx.effect(() => authoring.mount(), 'agentkit-studio:authoring-owner');
   ctx.uiConversation.events.register(codexToolDefinition);
   ctx.effect(() => mountA2aObservation(ctx, { React }).dispose, 'agentkit-studio: A2A observation view');
+  // The conversation presentation slot owns Native turns as a whole. Adding
+  // an engine-event iframe here renders a second process view inside DSH's
+  // default transcript (and repeats its status, usage and error surfaces).
   // Settings owns first-run coordination. Registering here makes the
   // guide visible in the real DSH onboarding path and gives the shell a
   // stable entry it can reopen after the user chose “later”.
@@ -36,17 +40,15 @@ export function mountStudio(ctx, app) {
   }, props => h(CredentialOnboarding, { ...props, dshModel: createDshModelBridge(ctx) })));
   ctx.effect(() => connectionOwner.bind(ctx.connection), 'agentkit-studio:remote-connection');
   ctx.on('connection/reset', () => { window.dispatchEvent(new CustomEvent('agentkit-studio:credential-recheck')); window.dispatchEvent(new CustomEvent('agentkit-studio:connection-reset')); });
-  // DSH owns the single global plugin center. Studio contributes Codex as
-  // an official plugin item through the public plugin-manager slot, so the
-  // existing Codex catalog stays available without a second DSH market.
-  // Studio contributes the DSH plugin market (curated bundles plus an optional
-  // remote index) as a row inside the official 插件 page.
-  ctx.slots.inject('plugins.item', () => ctx.slots.register({
-    name: 'plugins.item', id: 'agentkit-dsh-plugin-market', order: 50, label: '插件市场',
-  }, props => h(DshPluginMarketItem, props)));
+  // DSH owns the single global plugin center: its own 已安装 / 发现 tabs are the
+  // market, so Studio contributes no market row of its own. Codex stays an
+  // official plugin item through the same public plugin-manager slot.
   ctx.slots.inject('plugins.item', () => ctx.slots.register({
     name: 'plugins.item', id: 'agentkit-codex-plugin-market', order: 90, label: 'Codex 插件',
   }, props => h(CodexPluginMarketItem, props)));
+  ctx.slots.inject('plugins.item', () => ctx.slots.register({
+    name: 'plugins.item', id: 'agentkit-star-harness', order: 91, label: 'Star Harness',
+  }, props => h(StarHarnessItem, props)));
   ctx.effect(() => {
     const open = () => ctx.layout?.selectPanel?.('plugins');
     window.addEventListener('agentkit-studio:open-plugin-center', open);
@@ -77,11 +79,15 @@ export function mountStudio(ctx, app) {
     try {
       const roster = await hostRemote.agents();
       if (app.closed()) return;
-      const presetId = String(selectedPreset || ctx.sessions?.list?.getSnapshot?.().byId?.[sessionId]?.projectionValues?.agentPreset || '');
-      const agent = (roster?.items || []).find(item => presetIdForAgent(item) === presetId);
+      const session = ctx.sessions?.list?.getSnapshot?.().byId?.[sessionId];
+      const presetId = String(selectedPreset || session?.projectionValues?.agentPreset || '');
+      const agent = (roster?.items || []).find(item => {
+        const base = presetIdForAgent(item);
+        return base && (base === presetId || base + HARNESS_SERVICE_PRESET_SUFFIX === presetId);
+      });
       if (!agent) return;
       const agentId = String(agent?.metadata?.id || agent?.id || '').trim();
-      const admission = await hostRemote.ensureDshPreset(agentId);
+      const admission = await hostRemote.ensureDshPreset(agentId, '', presetId, session?.cwd ?? null);
       if (app.closed()) return;
       if (admission.modelSelection) {
         const selected = await selectSessionModel(ctx.remote, { sessionId, ...admission.modelSelection, saveDefault: false });
@@ -153,29 +159,6 @@ export function mountStudio(ctx, app) {
     { name: 'conversation.session.header.actions', id: 'agentkit-studio-native-children', order: -9 },
     props => h(ui.NativeChildPanel, { ...props, requestSessionStop: requestNativeSessionStop }),
   ));
-  ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register(
-    { name: 'conversation.session.header.actions', id: 'agentkit-studio-native-approval', order: -8 },
-    props => NativeApprovalPanel ? h(NativeApprovalPanel, {
-      ...props,
-      requestApprovalDecision: async request => {
-        let approvalDecision;
-        try {
-          const sessionRemote = ctx.remote?.session;
-          approvalDecision = sessionRemote?.approvalDecision;
-        } catch {
-          // A pre-RPC DSH host keeps the compatibility Studio route alive.
-          return null;
-        }
-        if (typeof approvalDecision !== 'function') return null;
-        const result = await approvalDecision(request);
-        if (result && typeof result === 'object' && 'ok' in result) {
-          if (!result.ok) throw result.error;
-          return result.value;
-        }
-        return result;
-      },
-    }) : null,
-  ));
 
   // Authoring entry: only the hero selector keeps the "创建 Agent" button.
   // The composer-left injection was removed — conversation authoring is a
@@ -200,7 +183,7 @@ export function mountStudio(ctx, app) {
   // Session to DSH's own navigation service. This keeps the native
   // composer visible from the first frame and makes binding an explicit
   // action rather than a side effect of opening a custom chat page.
-  ctx.inject(['uiWorkspace', 'sessions', 'modelDirectories'], navCtx => {
+  ctx.inject(['uiWorkspace', 'sessions', 'modelDirectories', 'workspaces'], navCtx => {
     const binding = createNativeSessionBinding({ navCtx, remote: ctx.remote, layout: ctx.layout, hostRemote, writeConversationAgent, actions, isActive: () => !app.closed() });
     const release = actions.registerBinding(binding.bindAgent);
     const releaseSession = actions.registerSessionOpener(sessionId => { if (app.closed()) return; navCtx.uiWorkspace.openSession(sessionId); ctx.layout.selectPanel(null); });

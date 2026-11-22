@@ -153,13 +153,13 @@ export function createProductClient(connection, { window = globalThis.window } =
       if (operation.status !== 'succeeded') throw Object.assign(new Error(operation.error?.message || '模板操作被中断，可重新尝试'), { code: operation.error?.code || 'TEMPLATE_OPERATION_FAILED' });
       return operation.result;
     }
-    async function ensureDshPreset(agentId, buildId = '') {
+    async function ensureDshPreset(agentId, buildId = '', presetId, cwd) {
         if (!connection?.rpc?.call) {
             const error = new Error('DSH Agent preset 准入需要已连接的 Studio Host');
             error.code = 'DSH_PRESET_HOST_CONNECTION_MISSING';
             throw error;
         }
-        const result = await callStudioOperation(connection, 'agents/ensure-preset', { agentId, ...(buildId ? { buildId } : {}) });
+        const result = await callStudioOperation(connection, 'agents/ensure-preset', { agentId, ...(buildId ? { buildId } : {}), ...(presetId ? { presetId } : {}), ...(cwd === undefined ? {} : { cwd }) });
         if (!result?.ok) {
             const error = new Error(result?.error?.message || 'DSH Agent preset 准入失败');
             error.code = result?.error?.code || 'DSH_PRESET_ADMISSION_FAILED';
@@ -212,7 +212,7 @@ export function createProductClient(connection, { window = globalThis.window } =
             return result.value;
         }
         const bridgeByEndpoint = {
-            'skills/discover': scanPaths => request('/api/v1/catalog/skills:discover', { method: 'POST', body: JSON.stringify({ scanPaths: Array.isArray(scanPaths) ? scanPaths : [] }) }),
+            'skills/discover': payload => request('/api/v1/catalog/skills:discover', { method: 'POST', body: JSON.stringify(payload) }),
             'skills/preview-discovered': ({ inspectionToken, candidateId, path }) => request('/api/v1/catalog/skills/discoveries/' + encodeURIComponent(inspectionToken) + '/candidates/' + encodeURIComponent(candidateId) + '/files' + (path ? '?path=' + encodeURIComponent(path) : '')),
             'skills/commit-discovered': ({ inspectionToken, candidateId, overwrite }) => request('/api/v1/catalog/skills/discoveries/' + encodeURIComponent(inspectionToken) + ':commit', { method: 'POST', body: JSON.stringify({ candidateId, overwrite }) }),
             'skills/preview-installed': ({ resourceId, path }) => request('/api/v1/catalog/skills/' + encodeURIComponent(resourceId) + '/files' + (path ? '?path=' + encodeURIComponent(path) : '')),
@@ -227,6 +227,8 @@ export function createProductClient(connection, { window = globalThis.window } =
         settings: () => studioCall('settings/get'),
         modelCatalog: profileId => studioCall('models/catalog', { profileId }),
         probeModelEndpoint: payload => studioCall('models/probe', payload || {}),
+        probeModelWire: (payload, signal) => studioBridgeOperation('models/wire', payload || {}, signal),
+        probeModelEfforts: (payload, signal) => studioBridgeOperation('models/efforts', payload, signal),
         updateSettings: payload => studioCall('settings/update', payload),
         runtimes: () => directServer()
             ? Promise.resolve({ items: [{ runtimeType: 'dsh-native', label: 'DSH Native Harness', source: 'dsh' }], source: 'dsh' })
@@ -418,17 +420,20 @@ export function createProductClient(connection, { window = globalThis.window } =
             : request('/api/v1/catalog/mcp-servers/' + encodeURIComponent(resourceId), { method: 'PUT', body: JSON.stringify(payload) }),
         createModelResource: payload => bridgeAvailable() ? studioBridgeOperation('models/create', payload) : request('/api/v1/catalog/model-profiles', { method: 'POST', body: JSON.stringify(payload) }),
         createToolResource: payload => request('/api/v1/catalog/tools', { method: 'POST', body: JSON.stringify(payload) }),
-        deleteResource: (resourceId, scope = 'local') => bridgeAvailable()
-            ? studioBridgeOperation('resources/delete', { resourceId, scope })
-            : scope === 'cloud' ? Promise.reject(new Error('删除云端 MCP 需要连接 Studio Host'))
-                : request('/api/v1/catalog/resources/' + encodeURIComponent(resourceId), { method: 'DELETE' }),
+        deleteResource: (resourceId, scope = 'local', kind) => bridgeAvailable()
+            ? studioBridgeOperation('resources/delete', { resourceId, scope, ...(kind ? { kind } : {}) })
+            : kind === 'skill' ? Promise.reject(new Error('移除本地 Skill 需要连接 Studio Host'))
+                : scope === 'cloud' ? Promise.reject(new Error('删除云端 MCP 需要连接 Studio Host'))
+                    : request('/api/v1/catalog/resources/' + encodeURIComponent(resourceId), { method: 'DELETE' }),
         probeMcpResource: (resourceId, timeoutSeconds = 15) => (bridgeAvailable() && (localMcpId(resourceId) || directServer()))
             ? studioBridgeOperation('mcp/probe', { resourceId, timeoutSeconds })
             : request('/api/v1/catalog/mcp-servers/' + encodeURIComponent(resourceId) + ':probe?timeoutSeconds=' + encodeURIComponent(timeoutSeconds), { method: 'POST' }),
         // Skill discovery runs locally inside the plugin Node host over the
         // same authenticated bridge; the legacy Studio Host REST routes are
         // kept for a local-Host deployment only.
-        discoverSkills: (scanPaths = []) => skillBridgeCall('skills/discover', { scanPaths: Array.isArray(scanPaths) ? scanPaths : [] }),
+        discoverSkills: (scanPaths = [], { fromInstalled = false } = {}) => skillBridgeCall('skills/discover', {
+            scanPaths: Array.isArray(scanPaths) ? scanPaths : [], ...(fromInstalled ? { fromInstalled: true } : {}),
+        }),
         previewDiscoveredSkill: (inspectionToken, candidateId, path = '') => skillBridgeCall('skills/preview-discovered', { inspectionToken, candidateId, path }),
         commitDiscoveredSkill: (inspectionToken, candidateId, overwrite = false) => skillBridgeCall('skills/commit-discovered', { inspectionToken, candidateId, overwrite }),
         previewInstalledSkill: (resourceId, path = '') => skillBridgeCall('skills/preview-installed', { resourceId, path }),
@@ -447,25 +452,14 @@ export function createProductClient(connection, { window = globalThis.window } =
         updateSchedule: (agentId, taskId, payload) => directServer() ? studioBridgeOperation('schedules/update', { agentId, taskId, patch: payload }) : request('/api/v1/agents/' + encodeURIComponent(agentId) + '/schedules/' + encodeURIComponent(taskId), { method: 'PUT', body: JSON.stringify(payload) }),
         deleteSchedule: (agentId, taskId) => directServer() ? studioBridgeOperation('schedules/delete', { taskId, agentId }) : request('/api/v1/agents/' + encodeURIComponent(agentId) + '/schedules/' + encodeURIComponent(taskId), { method: 'DELETE' }),
         runSchedule: (agentId, taskId) => directServer() ? studioBridgeOperation('schedules/run', { taskId, agentId }) : request('/api/v1/agents/' + encodeURIComponent(agentId) + '/schedules/' + encodeURIComponent(taskId) + ':run', { method: 'POST' }),
-        dshPlugins: () => (bridgeAvailable()
-            ? studioBridgeOperation('plugins/dsh-list', {})
-            : request('/api/v1/plugin-ecosystems/dsh/plugins')).then(dshPluginMarketList),
-        refreshDshPluginIndex: () => bridgeAvailable() ? studioBridgeOperation('plugins/dsh-index-refresh', {}) : request('/api/v1/plugin-ecosystems/dsh/catalog:refresh', { method: 'POST' }),
-        discoverDshPlugins: (options = {}) => bridgeAvailable()
-            ? studioBridgeOperation('plugins/dsh-discover', { force: options?.force === true })
-            : request('/api/v1/plugin-ecosystems/dsh/discover' + (options?.force ? '?force=true' : '')),
         // Lifecycle calls must live on the base product client: the DSH plugin
         // surface mounts this object directly (no compatibility extension), so
         // compatibility-methods-only keys would be missing at runtime.
-        installDshPlugin: (source, acceptHostPermissions = false) => bridgeAvailable() ? studioBridgeOperation('plugins/dsh-install', { source, acceptHostPermissions }) : request('/api/v1/plugin-ecosystems/dsh/plugins:install', {
-            method: 'POST', body: JSON.stringify({ source, acceptHostPermissions }),
-        }),
-        enableDshPlugin: pluginName => bridgeAvailable() ? studioBridgeOperation('plugins/dsh-enable', { pluginName }) : request('/api/v1/plugin-ecosystems/dsh/plugins/' + encodeURIComponent(pluginName) + ':enable', { method: 'POST' }),
-        disableDshPlugin: pluginName => bridgeAvailable() ? studioBridgeOperation('plugins/dsh-disable', { pluginName }) : request('/api/v1/plugin-ecosystems/dsh/plugins/' + encodeURIComponent(pluginName) + ':disable', { method: 'POST' }),
-        updateDshPlugin: pluginName => bridgeAvailable() ? studioBridgeOperation('plugins/dsh-update', { pluginName }) : request('/api/v1/plugin-ecosystems/dsh/plugins/' + encodeURIComponent(pluginName) + ':update', {
-            method: 'POST', body: JSON.stringify({ acceptHostPermissions: true }),
-        }),
-        uninstallDshPlugin: pluginName => bridgeAvailable() ? studioBridgeOperation('plugins/dsh-remove', { pluginName }) : request('/api/v1/plugin-ecosystems/dsh/plugins/' + encodeURIComponent(pluginName), { method: 'DELETE' }),
+        starHarnessStatus: (options = {}, signal) => studioBridgeOperation('star-harness/status', options, signal),
+        installStarHarness: version => studioBridgeOperation('star-harness/install', { version }),
+        enableStarHarness: enabled => studioBridgeOperation('star-harness/enable', { enabled }),
+        bindStarHarness: (workspace, profileId) => studioBridgeOperation('star-harness/bind', { workspace, profileId }),
+        unbindStarHarness: workspace => studioBridgeOperation('star-harness/unbind', { workspace }),
         codexPlugins: () => bridgeAvailable() ? studioBridgeOperation('plugins/codex-list', {}) : request('/api/v1/plugin-ecosystems/codex/plugins'),
         inspectCodexPlugin: pluginId => studioBridgeOperation('plugins/codex-inspect', { pluginId }),
         installCodexPlugin: (pluginId, marketplaceName) => bridgeAvailable() ? studioBridgeOperation('plugins/codex-install', { pluginId, marketplaceName }) : request('/api/v1/plugin-ecosystems/codex/plugins/' + encodeURIComponent(pluginId) + ':install', {

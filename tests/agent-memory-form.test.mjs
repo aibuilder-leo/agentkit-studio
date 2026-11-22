@@ -236,6 +236,7 @@ function formHarness(props = {}, options = {}) {
   const captured = options.captured || {};
   const hostRemote = options.hostRemote || {
     resources: kind => Promise.resolve(kind === 'model' ? { items: [{ resourceId: 'model-1', displayName: 'Model 1' }], defaultModel: 'model-1' } : { items: [] }),
+    starHarnessStatus: options.starHarnessStatus,
     codexModels: () => Promise.resolve({ items: [{ resourceId: 'model-1', displayName: 'Model 1' }], defaultModel: 'model-1' }),
     quickAuthorAgent: async payload => { captured.create = payload; return { metadata: { id: payload.slug, name: payload.name, revision: 1 } }; },
     updateAgent: async (id, spec, revision, name) => { captured.update = { id, spec, revision, name }; return { metadata: { id, name, revision: (revision || 1) + 1 } }; },
@@ -263,15 +264,21 @@ const switchToHarness = (harness, tree) => {
   return harness.render();
 };
 
-test('form: new local authoring defaults to DSH Native and disables Star Harness until it is stable', async () => {
+test('form: new local authoring defaults to DSH Native and enables Star Harness only when the Host reports readiness', async () => {
   const hidden = formHarness({ onBack: () => {}, onCreated: () => {} });
   let tree = hidden.render(); await hidden.flush(); tree = hidden.render();
   const runtimeSelect = findBy(tree, node => node.props.role === 'radio' && node.props['data-runtime'] === 'dsh-native');
   assert.equal(runtimeSelect.props['aria-checked'], true);
   const unavailable = findBy(tree, node => node.props.role === 'radio' && node.props['data-runtime'] === 'harness');
   assert.equal(unavailable.props.disabled, true);
-  assert.equal(unavailable.props.title, '该能力暂未开放');
-  assert.match(JSON.stringify(unavailable.children), /未开放/);
+  assert.equal(unavailable.props.title, '在插件页安装并启用 Star Harness');
+  assert.match(JSON.stringify(unavailable.children), /未安装/);
+  const installed = formHarness({}, { starHarnessStatus: async () => ({ canCreate: true }) });
+  installed.render();
+  await installed.flush();
+  assert.equal(findBy(installed.render(), node => node.props['data-runtime'] === 'harness').props.disabled, false);
+  findBy(installed.render(), node => node.props['data-runtime'] === 'harness').props.onClick();
+  assert.equal(findBy(installed.render(), node => node.props['data-runtime'] === 'harness').props['aria-checked'], true);
   const enabled = formHarness({ allowHarnessRuntime: true, onBack: () => {}, onCreated: () => {} });
   let enabledTree = enabled.render(); await enabled.flush(); enabledTree = enabled.render();
   assert.equal(findBy(enabledTree, node => node.props.role === 'radio' && node.props['data-runtime'] === 'harness').props.disabled, false, 'explicit opt-in restores the Star Harness option');
@@ -280,6 +287,14 @@ test('form: new local authoring defaults to DSH Native and disables Star Harness
   const editSelect = findBy(editTree, node => node.props.role === 'radio' && node.props['data-runtime'] === 'harness');
   assert.equal(editSelect.props['aria-checked'], true, 'editing an existing harness Agent keeps its runtime visible');
   assert.equal(editSelect.props.disabled, true);
+});
+
+test('form: a failed Star Harness readiness read keeps creation unavailable', async () => {
+  const form = formHarness({}, { starHarnessStatus: async () => { throw Error('Host offline'); } });
+  form.render(); await form.flush();
+  const runtime = findBy(form.render(), node => node.props['data-runtime'] === 'harness');
+  assert.equal(runtime.props.disabled, true);
+  assert.match(JSON.stringify(runtime.children), /未安装/);
 });
 
 test('form: harness blank create offers the local memory source and needs no binding', async () => {

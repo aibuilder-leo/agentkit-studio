@@ -9,8 +9,10 @@ export default String.raw`
 .agentkit-settings-launcher:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #4b73e8); outline-offset: 2px; }
 .agentkit-settings-launcher[data-wide="false"] { flex: none; width: 36px; height: 36px; padding: 0; gap: 0; justify-content: center; }
 /* Secondary buttons keep their own label color on the neutral hover surface.
-   Primary buttons are excluded here so their white label never lands on it. */
-:where([data-agentkit-studio="product-application"], [data-studio-model-settings], [data-studio-controls], .agentkit-credential-onboarding-content) button:not(:disabled):not([style*="--dsw-alias-label-primary-foreground"]):not([style*="--dsw-alias-button-primary-fill"]):not([data-variant="primary"]):not(.sq-btn.primary):hover {
+   Primary buttons are excluded here so their white label never lands on it.
+   Switches are excluded too: their white knob would vanish on the same
+   neutral surface, so they keep their own state colors and hover separately. */
+:where([data-agentkit-studio="product-application"], [data-studio-model-settings], [data-studio-controls], .agentkit-credential-onboarding-content) button:not(:disabled):not([role="switch"]):not([style*="--dsw-alias-label-primary-foreground"]):not([style*="--dsw-alias-button-primary-fill"]):not([data-variant="primary"]):not(.sq-btn.primary):hover {
   background: var(--dsw-alias-interactive-bg-hover, #f0f0f0) !important;
 }
 /* Primary buttons (white label on a dark fill) keep a dark hover fill and the
@@ -48,18 +50,6 @@ export default String.raw`
 [data-agentkit-studio="product-application"] [data-studio-tabs] > button { flex: 0 0 auto; white-space: nowrap; }
 [data-agentkit-studio="product-application"] [data-studio-heading],
 [data-agentkit-studio="product-application"] [data-studio-content-intro] { flex-wrap: wrap; align-items: flex-start; }
-[data-studio-model-settings] { container-type: inline-size; }
-[data-studio-model-settings] input, [data-studio-model-settings] select { min-width: 0; box-sizing: border-box; }
-[data-studio-model-settings] { font-size: 14px; line-height: 22px; }
-[data-studio-model-settings] label { font-size: 14px !important; font-weight: 500 !important; }
-[data-studio-model-settings] input, [data-studio-model-settings] select { height: 32px; font: inherit !important; border-radius: var(--dsw-radius-md, 12px) !important; }
-[data-studio-model-settings] details { font-size: 13px !important; }
-[data-studio-model-settings] form > section:last-of-type { border: 0 !important; border-top: 1px solid var(--dsw-alias-border-l3, #d4d4d4) !important; border-radius: 0 !important; padding: 20px 0 0 !important; background: transparent !important; }
-[data-studio-model-settings] h3 { font-size: 16px !important; font-weight: 600 !important; }
-[data-studio-model-settings] section > div > div > p { font-size: 13px !important; line-height: 1.5; margin-top: 6px !important; }
-@container (max-width: 540px) {
-  [data-studio-model-settings] [style*="grid-template-columns"] { grid-template-columns: minmax(0, 1fr) !important; }
-}
 @media (max-width: 960px) {
   [data-agentkit-studio="product-application"] [style*="grid-template-columns"] { grid-template-columns: minmax(0, 1fr) !important; }
   [data-agentkit-studio="product-application"] [data-studio-agent-grid],
