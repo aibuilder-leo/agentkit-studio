@@ -96,7 +96,7 @@ export function createAgentPages({
         h('div', { className: 'studio-row-main' },
           h('div', { className: 'studio-row-title' }, h('strong', null, summary.name || summary.id), h('code', { className: 'studio-row-id' }, summary.id)),
           h('div', { className: 'studio-row-meta' }, [RUNTIME_LABELS[summary.runtime] || summary.runtime, summary.revision ? `r${summary.revision}` : ''].filter(Boolean).join(' · '))),
-        Button({ size: 'sm', variant: 'outline', className: 'ak-agent-chat', disabled: binding || summary.chatDisabled, onClick: () => void bind() }, binding ? '正在绑定…' : '对话')),
+        Button({ size: 'sm', variant: 'outline', className: 'ak-detail-chat', disabled: binding || summary.chatDisabled, onClick: () => void bind() }, binding ? '正在绑定…' : '对话')),
       summary.deliverable ? h(StudioSubnav, { variant: 'segmented', ariaLabel: 'Agent 管理', value: panel, onChange: setPanel, items: [{ id: 'config', label: '配置' }, { id: 'delivery', label: '构建与部署' }] }) : null,
       saved && panel === 'delivery' ? h('div', { role: 'status', className: 'ak-agents-notice' }, `已保存 ${saved.name || saved.id}（r${saved.revision || 1}），重新构建后对话和部署才会使用新配置。`) : null,
       h('div', { 'data-agent-panel': 'config', hidden: panel !== 'config' },
